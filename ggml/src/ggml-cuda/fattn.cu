@@ -592,6 +592,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if (getenv("NEXT_QSA_OPT") && cc == GGML_CUDA_CC_AMPERE && Q->ne[0] == 256 &&
+                Q->ne[1] == 1 && Q->ne[3] == 1 && K->ne[1] >= 131072 &&
+                K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && gqa_opt_applies && gqa_ratio == 12) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {

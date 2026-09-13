@@ -153,3 +153,21 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# 170hx-qwen-flash: never commit model files, builds, traces or logs
+build*/
+*.gguf
+*.csv
+*.qdstrm
+*.sqlite
+*.data
+*.log
+logs/
+next/tools/bench/*.out
+*.so
+*.so.*
+*.out
+*.bak
+__pycache__/
+*.pyc
+next/tools/mini/logs/

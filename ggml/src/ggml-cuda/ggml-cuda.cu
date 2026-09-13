@@ -1,3 +1,5 @@
+#include "qsa.cuh"
+#include "../ggml-qsa.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -2073,6 +2075,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_REPEAT_BACK:
             ggml_cuda_op_repeat_back(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (!ggml_qsa_kind(dst)) return false;
+            ggml_cuda_op_qsa(ctx, dst);
+            break;
         case GGML_OP_GET_ROWS:
             ggml_cuda_op_get_rows(ctx, dst);
             break;
@@ -2584,7 +2590,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // NEXT: graphs of different shapes can start at the same node address (the MTP draft context alternates between the
+    // multi-token accept pass and the single-token draft pass); mixing the node count into the key keeps them from
+    // sharing one ggml_cuda_graph entry and resetting each other's warmup on every call
+    return (const void *) ((uintptr_t) cgraph->nodes[0] ^ ((uintptr_t) cgraph->n_nodes << 48));
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -5174,6 +5183,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_CUSTOM:
+            return ggml_qsa_kind(op) != 0;
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -5203,6 +5214,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                         return true;
                     case GGML_TYPE_IQ4_NL:
+                        return op->src[0]->ne[0] % QK4_NL == 0;
                     case GGML_TYPE_MXFP4:
                         // 32-value sub-blocks, the row size does not guarantee
                         // the QK_K super-blocks the get_rows kernel iterates on

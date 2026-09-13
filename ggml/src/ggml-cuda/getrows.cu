@@ -2,6 +2,16 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+// Decode a native 32-value IQ4_NL block for rows smaller than a K super-block.
+static __device__ __forceinline__ void dequantize_iq4_nl_pair(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_iq4_nl * x = static_cast<const block_iq4_nl *>(vx) + ib;
+    const float d = x->d;
+    const uint8_t q = x->qs[iqs];
+    v.x = d * kvalues_iq4nl[q & 0x0f];
+    v.y = d * kvalues_iq4nl[q >> 4];
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -393,8 +403,13 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            if (ne00 % QK_K == 0) {
+                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                get_rows_cuda_q<QK4_NL, 2, dequantize_iq4_nl_pair>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            }
             break;
         case GGML_TYPE_IQ4_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
