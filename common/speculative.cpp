@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "next-opt-common.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1357,6 +1358,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // NEXT: per-sequence acceptance EMA (accepted / drafted) for the adaptive draft length
+    std::vector<float>   acc_rate;
+    std::vector<int32_t> n_drafted_last;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1385,6 +1390,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+
+        acc_rate.assign(n_seq, 0.65f);
+        n_drafted_last.assign(n_seq, 0);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1627,6 +1635,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        int32_t n_max_rt = params.n_max;
+        float   p_min_rt = params.p_min;
+        next_spec_overrides(params.n_max, params.p_min, n_max_rt, p_min_rt);
+        const bool adaptive = next_spec_adaptive();
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1679,7 +1692,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < p_min_rt) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1693,7 +1706,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                const int32_t n_lim = adaptive ? next_spec_adapt_n(n_max_rt, acc_rate[seq_id]) : n_max_rt;
+                if (n_lim <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1743,12 +1757,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+
+            n_drafted_last[seq_id] = (int32_t) dp.result->size();
         }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (n_drafted_last[seq_id] > 0) {
+            const float r = std::min(1.0f, (float) n_accepted / (float) n_drafted_last[seq_id]);
+            acc_rate[seq_id] = 0.85f*acc_rate[seq_id] + 0.15f*r;
+            n_drafted_last[seq_id] = 0;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
