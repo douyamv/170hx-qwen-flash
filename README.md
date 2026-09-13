@@ -2,7 +2,7 @@
 
 Serving **Qwen3.8-Flash-Next** (125B MoE, 6B active, 262K context, Qwen Sparse Attention + Gated DeltaNet +
 hyper-connections + MTP) with **llama.cpp on four NVIDIA CMP 170HX mining cards** (40 GB HBM2e each, PCIe Gen2,
-no P2P, 15 GB host RAM), and the CUDA/scheduler work that took single-stream decode from ~35 tok/s to ~75 tok/s.
+no P2P, 15 GB host RAM), and the CUDA/scheduler work that took single-stream decode from ~45 tok/s to ~70 tok/s at 70K context (and 27 → 60+ at long contexts).
 
 This repository is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (via the Unsloth
 `qwen4exp` branch) plus everything needed to reproduce the deployment: kernels, graph changes, launch files, the
@@ -16,13 +16,13 @@ tracing/benchmark tooling and a 4-layer "mini model" harness used to validate ev
 Single request (`--parallel 1`), UD-Q4_K_XL weights, q8_0 KV cache, MTP speculative decoding (draft length 4,
 GPU sampling), 4× CMP 170HX. Decode = generated tokens / second as reported by `llama-server` (`print_timing`).
 
-| Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14) | This repo (Phase C, mini-validated, being deployed) |
+| Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14 01:25) | This repo (opt-v5, 2026-09-14 07:23, measured) |
 |---|---|---|---|
-| 2K | 46–55 tok/s | 60–72 | **72–77 (est.)** |
-| 70K | 27–45 | 45–52 | **55–62 (est.)** |
-| 200K | 27–37 | 35–45 | **42–52 (est.)** |
-| Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | same |
-| Prefill 70K prompt | 159–186 s | **104 s** | same |
+| 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** |
+| 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** |
+| 200K | 27–37 | 35–45 | not yet re-measured (expected 45–55) |
+| Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s |
+| Prefill 70K prompt | 159–186 s | **104 s** | 102 s |
 | Full 262K load from USB HDD | ~29 min | ~29 min | same |
 
 Reference points from the community for the same GGUF: 5×RTX 3090 (layer split, no MTP) 54–57 tok/s short /
