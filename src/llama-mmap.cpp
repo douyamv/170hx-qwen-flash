@@ -470,6 +470,8 @@ struct llama_mmap::impl {
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
+        // Avoid an eager full-file read on hosts with much less RAM than model weights.
+        if (getenv("LLAMA_NO_MMAP_PREFETCH") != nullptr) { prefetch = 0; }
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",

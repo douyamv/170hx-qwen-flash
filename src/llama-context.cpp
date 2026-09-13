@@ -1,3 +1,4 @@
+#include "llama-trace-local.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -602,7 +603,15 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // NEXT: llama_set_sampler() (called by the server for every request) requests a re-reserve. Recreating the
+    // scheduler here freed and reallocated every compute buffer and the pinned host input buffer (~0.6 s per
+    // request with n_ubatch 1024 at 262K ctx, then page faults on the fresh buffers during the first decode
+    // steps). Keep the existing scheduler: ggml_backend_sched_reserve re-plans and only grows buffers.
+    // NEXT_SCHED_RECREATE=1 restores the old behaviour.
+    static const bool sched_recreate = getenv("NEXT_SCHED_RECREATE") != nullptr;
+    if (!sched || sched_recreate) {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1642,6 +1651,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    llama_trace_local trace(cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "DECODE_MTP" : "DECODE_TARGET");
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
