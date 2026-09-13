@@ -1,0 +1,189 @@
+--- /home/douya/tests/opt-20260913/mmq.cu.orig-codex	2026-09-13 01:29:29.562578814 +0800
++++ ggml/src/ggml-cuda/mmq.cu	2026-09-13 17:45:07.968366218 +0800
+@@ -1,5 +1,38 @@
+ #include "common.cuh"
+ #include "mmq.cuh"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <sys/stat.h>
++#include <vector>
++
++// Runtime switches under $NEXT_OPT_DIR, re-checked at most once per second.
++static bool next_opt_file_exists(const char * name, std::chrono::steady_clock::time_point & next_check, bool & cached) {
++    const auto now = std::chrono::steady_clock::now();
++    if (now >= next_check) {
++        next_check = now + std::chrono::seconds(1);
++        const char * dir = getenv("NEXT_OPT_DIR");
++        struct stat st;
++        cached = dir != nullptr && stat((std::string(dir) + "/" + name).c_str(), &st) == 0;
++    }
++    return cached;
++}
++
++static bool next_mmq_grid_enabled() {
++    static std::chrono::steady_clock::time_point next_check{};
++    static bool off = false;
++    return !next_opt_file_exists("mmq_grid_off", next_check, off);
++}
++
++static bool next_mmq_stats_enabled() {
++    static std::chrono::steady_clock::time_point next_check{};
++    static bool on = false;
++    return next_opt_file_exists("mmq_stats", next_check, on);
++}
++
+ #include "quantize.cuh"
+ #include "mmid.cuh"
+ 
+@@ -244,6 +277,45 @@
+                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+     const int64_t s13 = ne12*s12;
+ 
++    // The CUDA grid gives every expert ceil(ncols_max/J) tiles and each tile computes all J columns,
++    // so sizing it by the token count wastes most of the work when tokens spread over many experts.
++    // Size it by the busiest expert instead; keep the token count while capturing a CUDA graph because
++    // the replayed grid must cover any later routing.
++    int64_t ncols_max = ne12;
++    const bool grid_enabled = next_mmq_grid_enabled();
++    const bool stats_enabled = next_mmq_stats_enabled();
++    if (ne12 >= 32 && (grid_enabled || stats_enabled)) {
++        bool capturing = false;
++#ifdef USE_CUDA_GRAPH
++        cudaStreamCaptureStatus capture_status;
++        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
++        capturing = capture_status != cudaStreamCaptureStatusNone;
++#endif // USE_CUDA_GRAPH
++        if (!capturing) {
++            std::vector<int32_t> bounds(ne02 + 1);
++            CUDA_CHECK(cudaMemcpyAsync(bounds.data(), expert_bounds.get(), (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++            CUDA_CHECK(cudaStreamSynchronize(stream));
++            int32_t max_load = 1;
++            int32_t used = 0;
++            for (int64_t e = 0; e < ne02; ++e) {
++                const int32_t l = bounds[e + 1] - bounds[e];
++                max_load = std::max(max_load, l);
++                used += l > 0;
++            }
++            if (grid_enabled) {
++                ncols_max = std::min<int64_t>(max_load, ne12);
++            }
++            if (stats_enabled) {
++                static int64_t n_calls = 0;
++                if ((n_calls++ % 97) == 0) {
++                    fprintf(stderr, "NEXT_MMQ_STATS type=%d rows=%lld experts=%lld used=%d max_load=%d avg_load=%.2f grid=%d\n",
++                            (int) src0->type, (long long) ne_get_rows, (long long) ne02, used, max_load,
++                            used ? (double) bounds[ne02] / used : 0.0, grid_enabled ? 1 : 0);
++                }
++            }
++        }
++    }
++
+     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+     const mmq_args args = {
+         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+@@ -251,7 +323,7 @@
+         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+         ne02, ne02, s02, s12, s2,
+         ne03, ne13, s03, s13, s3,
+-        ne12};
++        ncols_max};
+ 
+     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+ }
+--- /home/douya/tests/opt-20260913/orig/src/models/qwen4exp.cpp	2026-09-13 09:58:35.925081636 +0800
++++ src/models/qwen4exp.cpp	2026-09-13 17:45:07.975514196 +0800
+@@ -1,4 +1,5 @@
+ #include "../../ggml/src/ggml-qsa.h"
++#include "../llama-next-opt.h"
+ #include <cstdlib>
+ #include "models.h"
+ #include "llama-impl.h"
+@@ -853,7 +854,7 @@
+ 
+     ggml_tensor * pooled = nullptr;
+     if (getenv("NEXT_QSA_OPT") && n_stream == 1 && n_tps <= 8 && r == 4 && idx_dim == 128 &&
+-            k_all->type == GGML_TYPE_Q8_0 && model.layers[il].index_k_norm->type == GGML_TYPE_F32 && n_kv >= 131072) {
++            k_all->type == GGML_TYPE_Q8_0 && model.layers[il].index_k_norm->type == GGML_TYPE_F32 && n_kv >= next_qsa_min_kv()) {
+         pooled = ggml_qsa_pool_norm(ctx0, k_all, inp->blk_cells, model.layers[il].index_k_norm, hparams.f_norm_rms_eps);
+         cb(pooled, "qsa_pool_norm_fused", il);
+     } else {
+@@ -919,7 +920,7 @@
+ 
+     ggml_tensor * expanded = nullptr;
+     if (getenv("NEXT_QSA_OPT") && n_stream == 1 && n_tps <= 8 && blk_bias &&
+-            kq_mask->type == GGML_TYPE_F16 && n_kv >= 131072) {
++            kq_mask->type == GGML_TYPE_F16 && n_kv >= next_qsa_min_kv()) {
+         expanded = ggml_qsa_expand(ctx0, score, inp->cell_blk, kq_mask);
+     } else {
+     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+@@ -941,7 +942,7 @@
+     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+ 
+     ggml_tensor * selected = nullptr;
+-    if (getenv("NEXT_QSA_OPT") && n_stream == 1 && n_tps > 1 && n_tps <= 8 && n_kv >= 131072) {
++    if (getenv("NEXT_QSA_OPT") && n_stream == 1 && n_tps > 1 && n_tps <= 8 && n_kv >= next_qsa_min_kv()) {
+         for (int64_t q = 0; q < n_tps; ++q) {
+             auto * row = ggml_view_1d(ctx0, expanded, n_kv, q*expanded->nb[1]);
+             auto * one = ggml_top_k(ctx0, row, width);
+@@ -1000,7 +1001,7 @@
+ 
+     ggml_tensor * kq_mask = inp->get_kq_mask();
+     if (getenv("NEXT_QSA_OPT") && n_tokens <= 8 && kq_mask->ne[3] == 1 &&
+-            kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[0] >= 131072) {
++            kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[0] >= next_qsa_min_kv()) {
+         auto * k = mctx_cur->get_k(ctx0, il);
+         auto * v = mctx_cur->get_v(ctx0, il);
+         if (k->ne[0] == 256 && v->ne[0] == 256 && k->ne[1] == 2 && v->ne[1] == 2 && k->ne[3] == 1 && v->ne[3] == 1 &&
+--- /home/douya/tests/opt-20260913/orig/src/llama-memory-hybrid-idx.cpp	2026-09-13 08:09:35.871799657 +0800
++++ src/llama-memory-hybrid-idx.cpp	2026-09-13 17:45:07.979485313 +0800
+@@ -1,4 +1,5 @@
+ #include "llama-trace-local.h"
++#include "llama-next-opt.h"
+ #include <cstdlib>
+ #include "llama-memory-hybrid-idx.h"
+ 
+@@ -301,7 +302,7 @@
+     GGML_ASSERT(r <= 64);
+     const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
+ 
+-    if (getenv("NEXT_QSA_OPT") && ratio == 4 && n_ns == 1 && n_tps <= 8 && blk_bias && n_kv >= 131072) {
++    if (getenv("NEXT_QSA_OPT") && ratio == 4 && n_ns == 1 && n_tps <= 8 && blk_bias && n_kv >= next_qsa_min_kv()) {
+         const auto & cells = get_mem_idx()->get_cells(ubatch->seq_id[0][0]);
+         const int64_t valid = cells.get_used();
+         bool eligible = valid > 0 && !cells.get_has_shift() && cells.used_min() == 0 &&
+--- /dev/null	2026-09-13 12:26:55.754809640 +0800
++++ src/llama-next-opt.h	2026-09-13 17:45:07.970460944 +0800
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++// Minimum KV size for the NEXT_QSA_OPT paths, read from $NEXT_OPT_DIR/qsa_min_kv at most once per second.
++inline int64_t next_qsa_min_kv() {
++    static std::chrono::steady_clock::time_point next_check{};
++    static int64_t value = 131072;
++    const auto now = std::chrono::steady_clock::now();
++    if (now >= next_check) {
++        next_check = now + std::chrono::seconds(1);
++        int64_t v = 131072;
++        if (const char * dir = getenv("NEXT_OPT_DIR")) {
++            if (FILE * f = fopen((std::string(dir) + "/qsa_min_kv").c_str(), "r")) {
++                long long x = 0;
++                if (fscanf(f, "%lld", &x) == 1 && x > 0) {
++                    v = x;
++                }
++                fclose(f);
++            }
++        }
++        value = v;
++    }
++    return value;
++}

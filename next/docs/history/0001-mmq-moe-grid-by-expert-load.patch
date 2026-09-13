@@ -1,0 +1,51 @@
+--- /home/douya/tests/opt-20260913/mmq.cu.orig-codex	2026-09-13 01:29:29.562578814 +0800
++++ ggml/src/ggml-cuda/mmq.cu	2026-09-13 17:40:44.535948115 +0800
+@@ -1,5 +1,8 @@
+ #include "common.cuh"
+ #include "mmq.cuh"
++
++#include <algorithm>
++#include <vector>
+ #include "quantize.cuh"
+ #include "mmid.cuh"
+ 
+@@ -244,6 +247,30 @@
+                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+     const int64_t s13 = ne12*s12;
+ 
++    // The CUDA grid gives every expert ceil(ncols_max/J) tiles and each tile computes all J columns,
++    // so sizing it by the token count wastes most of the work when tokens spread over many experts.
++    // Size it by the busiest expert instead; keep the token count while capturing a CUDA graph because
++    // the replayed grid must cover any later routing.
++    int64_t ncols_max = ne12;
++    if (ne12 >= 32) {
++        bool capturing = false;
++#ifdef USE_CUDA_GRAPH
++        cudaStreamCaptureStatus capture_status;
++        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
++        capturing = capture_status != cudaStreamCaptureStatusNone;
++#endif // USE_CUDA_GRAPH
++        if (!capturing) {
++            std::vector<int32_t> bounds(ne02 + 1);
++            CUDA_CHECK(cudaMemcpyAsync(bounds.data(), expert_bounds.get(), (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++            CUDA_CHECK(cudaStreamSynchronize(stream));
++            int32_t max_load = 1;
++            for (int64_t e = 0; e < ne02; ++e) {
++                max_load = std::max(max_load, bounds[e + 1] - bounds[e]);
++            }
++            ncols_max = std::min<int64_t>(max_load, ne12);
++        }
++    }
++
+     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+     const mmq_args args = {
+         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+@@ -251,7 +278,7 @@
+         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+         ne02, ne02, s02, s12, s2,
+         ne03, ne13, s03, s13, s3,
+-        ne12};
++        ncols_max};
+ 
+     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+ }

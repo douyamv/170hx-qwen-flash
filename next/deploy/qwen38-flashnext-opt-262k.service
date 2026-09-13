@@ -1,0 +1,22 @@
+[Unit]
+Description=Qwen3.8 Flash-Next 262K optimized build (MMQ expert grid, runtime QSA threshold)
+After=network.target
+Conflicts=qwen38-flashnext-optimized-262k.service
+
+[Service]
+Type=simple
+User=douya
+Group=douya
+WorkingDirectory=/home/douya
+# Cold boots bring the CMP 170HX links up at Gen1; restore Gen2 before loading (no-op when already Gen2).
+ExecStartPre=-+/usr/bin/python3 /home/douya/qwen-3.8-next/cmp170hx-gen2-hotload.py
+ExecStart=/usr/bin/python3 /home/douya/qwen-3.8-next-opt/run-server.py
+StandardOutput=append:/home/douya/qwen-3.8-next-opt/logs/server.log
+StandardError=append:/home/douya/qwen-3.8-next-opt/logs/server.log
+KillSignal=SIGINT
+TimeoutStartSec=600
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

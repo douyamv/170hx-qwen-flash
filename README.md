@@ -1,126 +1,105 @@
-# llama.cpp
+# 170hx-qwen-flash
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+Serving **Qwen3.8-Flash-Next** (125B MoE, 6B active, 262K context, Qwen Sparse Attention + Gated DeltaNet +
+hyper-connections + MTP) with **llama.cpp on four NVIDIA CMP 170HX mining cards** (40 GB HBM2e each, PCIe Gen2,
+no P2P, 15 GB host RAM), and the CUDA/scheduler work that took single-stream decode from ~35 tok/s to ~75 tok/s.
 
-<div align="center">
+This repository is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (via the Unsloth
+`qwen4exp` branch) plus everything needed to reproduce the deployment: kernels, graph changes, launch files, the
+tracing/benchmark tooling and a 4-layer "mini model" harness used to validate every change before touching the
+29-minute production load. Model weights are **not** included — see [Deployment](#deployment).
 
-<b>LLM inference in C/C++</b>
+中文摘要见文末 [中文说明](#中文说明).
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+## Results
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+Single request (`--parallel 1`), UD-Q4_K_XL weights, q8_0 KV cache, MTP speculative decoding (draft length 4,
+GPU sampling), 4× CMP 170HX. Decode = generated tokens / second as reported by `llama-server` (`print_timing`).
 
-</div>
+| Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14) | This repo (Phase C, mini-validated, being deployed) |
+|---|---|---|---|
+| 2K | 46–55 tok/s | 60–72 | **72–77 (est.)** |
+| 70K | 27–45 | 45–52 | **55–62 (est.)** |
+| 200K | 27–37 | 35–45 | **42–52 (est.)** |
+| Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | same |
+| Prefill 70K prompt | 159–186 s | **104 s** | same |
+| Full 262K load from USB HDD | ~29 min | ~29 min | same |
 
-## Quick start
+Reference points from the community for the same GGUF: 5×RTX 3090 (layer split, no MTP) 54–57 tok/s short /
+42 tok/s at 250K ([issue #28734](https://github.com/ggml-org/llama.cpp/issues/28734)); one RTX PRO 6000:
+108 tok/s without draft, 144–183 with MTP ([PR #28123](https://github.com/ggml-org/llama.cpp/pull/28123)).
 
-A few options to get `llama.cpp` installed on your machine:
+## What is in here
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+Every optimization is small, has an off-switch, and was checked for **bit-identical or reference-identical output**
+on the mini model before deployment. Details, measurements and file pointers: [next/docs/OPTIMIZATIONS.md](next/docs/OPTIMIZATIONS.md).
 
-Once installed:
+| Area | Change | Effect |
+|---|---|---|
+| CUDA GEMV | `q8a`: Q8_0/Q4_0 weights repacked once into a 16-byte-aligned split layout (int8 quants + fp16 scales) and a dp4a GEMV for decode batches ≤ 8 | dense projections 450 → 650–1000 GB/s; Q4_0 draft head 601 → 318 µs |
+| CUDA MoE | `moea`: expert-grouped GEMV for `mul_mat_id` (Q4_K up/gate with fused SwiGLU, Q5_1 down), tokens sharing an expert read it once | under validation |
+| CUDA top-k | deterministic radix select for `GGML_OP_TOP_K` (bit-identical to the argsort fallback incl. ties) + batched top-k over all query rows | QSA top-k 0.66 → 0.16 ms (70K), 2.1 → 0.18 ms (262K) per layer |
+| CUDA fused ops | hyper-connection mix tail and combine (13 kernels → 2 per block, 2 blocks per layer); fused gather+dequant+cast for the QSA compact path; `rms_norm+mul` in fusable form | ~1,300 fewer kernel launches per step |
+| MoE prefill | MMQ tile grid sized by the busiest expert instead of the token count | prefill +20% |
+| QSA memory | port of lukolszewski's persistent pooled block-key cache (recompute only dirty blocks) with an O(1) fast path for the single-stream contiguous case | no per-token re-pooling / re-rope of all blocks; 60% less H2D per step |
+| Scheduler | copy user inputs before cross-device inputs (no host stall at every GPU boundary); keep the scheduler on re-reserve instead of recreating it (was 0.6–0.9 s of `cudaMallocHost` per request) | TTFT 0.8–1.1 s → 0.25–0.4 s |
+| KV cache | honor `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` in `state_write/read` (server checkpoints were copying the whole MTP draft KV, up to 900 MB, every request) | TTFT at 200K 3.5 s → <1 s |
+| MTP | draft-only Q4_0 LM head (`make_mtp_q4head.py`), runtime `spec_n_max`/`spec_p_min`, acceptance-adaptive draft length | +4–17% depending on content |
+| Misc | GDN l2norm fix backported from upstream (#28068); `token_embd` kept in VRAM (was page-faulting from the HDD); strided conv-state store; mmvf for tiny-N F32 weights; CUDA-graph key stability for MTP | stability / jitter |
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+Runtime toggles live in `$NEXT_OPT_DIR` as plain files (see [next/deploy/README.md](next/deploy/README.md)):
+`spec_n_max`, `spec_p_min`, `spec_adaptive_off`, `qsa_min_kv`, `hc_fuse_off`, `qsa_gather_unfused`,
+`qsa_topk_rows`, `mmq_grid_off`, `draft_head_target`. Environment kill-switches: `NEXT_Q8A=0`, `NEXT_MOEA=0`,
+`NEXT_TOPK_SORT=1`, `NEXT_QSA_NO_BLKCACHE=1`, `NEXT_SCHED_RECREATE=1`.
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
-```
+## Deployment
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Hardware assumptions: 4 GPUs with ≥ 40 GB each (160 GB total), sm_80. Host RAM can be as small as 15 GB because
+the 51B-parameter n-gram table is stored as IQ4_NL (27 GB) **on the fourth GPU** instead of host memory — this is
+the reason llama.cpp fits where the vLLM/SGLang recipes (which keep a 51–102 GB table in host RAM) do not.
 
-## Description
+1. Build (CUDA 12.4, sm_80):
+   ```bash
+   cmake -S . -B build-sm80 -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80 -DGGML_CUDA_GRAPHS=ON -DCMAKE_BUILD_TYPE=Release
+   cmake --build build-sm80 --target llama-server -j
+   ```
+2. Weights: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) `UD-Q4_K_XL`
+   (104 GiB) and the MTP GGUF from the same repo; optionally create the draft-only Q4 head:
+   `python next/tools/gguf/make_mtp_q4head.py`.
+3. Launch: copy `next/deploy/launch.json.example` and adjust paths/GPU UUIDs; `run-server.py` starts `llama-server`
+   with those arguments and `pin-main.py` pins the main thread. The important flags are in the example:
+   layer split `16,16,17,0`, `--override-tensor "^per_layer_token_embd\.weight$=CUDA3,^token_embd\.weight$=CUDA2"`,
+   `--spec-type draft-mtp --spec-draft-device CUDA2`, `--batch-size 1024 --ubatch-size 1024`, `--cache-ram 0`,
+   `--backend-sampling`. Systemd units and the small OpenAI-compatible proxy are in `next/deploy/`.
+4. Validate before going live: `next/tools/mini/` builds a 4-layer GGUF from the full model (`make_mini.py`) and
+   runs the exact production flags on one spare GPU in two minutes; `next/tools/bench/` has the sweeps and TTFT probes.
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+## Upstreaming
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+The plan to contribute the reusable parts back to llama.cpp, split into small PRs, is in
+[next/docs/UPSTREAMING.md](next/docs/UPSTREAMING.md).
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## Credits
 
-## Supported backends
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and the Unsloth `qwen4exp` implementation
+  (Daniel Han) this fork is based on; upstream fixes #28023, #28068, #28123.
+- Łukasz Olszewski's block-key cache and compact attention work
+  ([issue #28734](https://github.com/ggml-org/llama.cpp/issues/28734), branches `issue/28734`, `q8-compact`).
+- The QSA compact decode path and the CUPTI tracer were first written with OpenAI Codex; the rest of the
+  optimization, tooling and validation in this repository was done with Claude Code.
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+License: MIT (same as llama.cpp).
 
-## Documentation
+## 中文说明
 
-#### Tools
+本仓库是在 4 张 NVIDIA CMP 170HX 矿卡（每卡 40 GB HBM2e，PCIe Gen2，无 P2P，主机内存仅 15 GB）上用 llama.cpp
+部署 Qwen3.8-Flash-Next（125B MoE，262K 上下文）的完整代码：CUDA 内核与调度器优化、启动/部署脚本、
+trace 与基准工具、以及用于上线前验证的 4 层 mini 模型工具链。**不包含模型权重**。
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+单请求 decode 速度：2K 上下文 46–55 → 60–72（本轮预计 72–77）tok/s；70K 27–45 → 45–52（预计 55–62）；
+200K 27–37 → 35–45（预计 42–52）；每轮首 token 延迟从 0.4–3.5 s 降到 0.25–0.4 s；70K prefill 从 159 s 降到 104 s。
 
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+主要优化（每项都有开关，上线前都在 mini 模型上做过逐 token 等价性验证）：对齐重排的 Q8_0/Q4_0 解码 GEMV、
+按专家分组的 MoE GEMV、确定性的 CUDA radix top-k、超连接与 QSA 路径的算子融合、MoE prefill 的专家负载网格、
+lukolszewski 的块键缓存移植、调度器跨卡输入顺序与复用修复、KV 检查点标志修复、MTP 的 Q4 草稿头与自适应草稿长度。
+详见 `next/docs/OPTIMIZATIONS.md`；部署步骤见 `next/deploy/README.md`；向上游提交的拆分计划见 `next/docs/UPSTREAMING.md`。
