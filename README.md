@@ -18,17 +18,23 @@ GPU sampling), 4× CMP 170HX. Decode = generated tokens / second as reported by 
 
 | Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14 01:25) | This repo (opt-v5, 2026-09-14 07:23, measured) | opt-v6 (2026-09-14 11:17, SM clock pinned) |
 |---|---|---|---|---|
-| 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** | V6_2K |
-| 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** | V6_70K |
+| 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** | **85–102 greedy (4/q4 101.9), 71–104 sampled (4/q4 103.9)** |
+| 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** | **70–81 greedy (4/q4 81.4), 56–82 sampled (5/q4 81.9)** |
 | 200K | 27–37 | 35–45 | not yet re-measured (expected 45–55) | not yet measured |
-| Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s | V6_TTFT |
-| Prefill 70K prompt | 159–186 s | **104 s** | 102 s | V6_PREFILL |
+| Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s | 0.24–0.43 s |
+| Prefill 70K prompt | 159–186 s | **104 s** | 102 s | 102 s |
 | Full 262K load from USB HDD | ~29 min | ~29 min | same | same |
 | Cold single request (2K prompt, 200 tokens, GPUs idle before) | 44 tok/s | 44 | **70 with the SM clock pinned (`nvidia-smi -lgc 1410,1410`, now in the service unit)** | pinned |
 
 Reference points from the community for the same GGUF: 5×RTX 3090 (layer split, no MTP) 54–57 tok/s short /
 42 tok/s at 250K ([issue #28734](https://github.com/ggml-org/llama.cpp/issues/28734)); one RTX PRO 6000:
 108 tok/s without draft, 144–183 with MTP ([PR #28123](https://github.com/ggml-org/llama.cpp/pull/28123)).
+
+The opt-v6 trace at 70K (sampled, ~4 tokens per step): GPU busy 28.8 ms per step (dev 8.3 / 7.9 / 12.6 ms) vs 38.3 ms
+for opt-v5; the dense `q8a` GEMVs and the `moea` expert GEMVs now run at 1.0–1.2 TB/s (the card's HBM peak is 1.39).
+The moea A/B on production (runtime file `moea_off`, same 70K prompt, greedy 200 tokens): 79.9 → 87.3 tok/s.
+What is left: ~1000 small kernels per GPU per step (~40% of GPU time) and host/transfer gaps between the three GPUs
+and the four MTP draft steps (~30% of the step).
 
 ## What is in here
 

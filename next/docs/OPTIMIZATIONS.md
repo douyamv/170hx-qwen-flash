@@ -56,6 +56,25 @@ GPU kernels 46 ms of a ~52 ms step (89%); host ~6 ms.
 opt-v6 = opt-v5 + moea v3.2 (default on) + q8a v2 plan table + `NEXT_TOPK_NOSORT=1` + the SM clock pin; the asynchronous
 input upload (row 20) stays off. Backups on the box: `bin.prev7`, `launch.json.prev7` (= opt-v5).
 
+Measured on production right after the deploy (`post10.sh`; opt-v5 numbers in brackets, both with the SM clock pinned):
+
+| | opt-v6 | opt-v5 |
+|---|---|---|
+| 2K greedy 4/q4 · 5/q4 · 3/q4 | 101.9 · 92.7 · 84.6 tok/s | 75.3 · 72.4 · 65.8 |
+| 2K sampled 4/q4 · 3/q4 · 5/q4 | 103.9 · 92–93 · 95.3 | 72.2 · 66.5–68 · 63.3 |
+| 70K greedy 4/q4 · 5/q4 · 3/q4 | 81.4 · 80.2 · 79.4 | 71.3 · 55.0 · 59.1 |
+| 70K sampled 5/q4 · 3/q8 · 4/q4 | 81.9 · 77.7 · 75.0 | 58.2 · 58.9 · 57.0 |
+| 70K moea A/B (greedy 200 tokens, `opt/moea_off`) | 87.3 on / 79.9 off (identical text for 37 tokens, then a numerics divergence; on/on repeat identical 200/200) | — |
+| TTFT, 4–17 new tokens at 70K | 0.24–0.43 s | 0.24–0.45 s |
+| prefill 70K | 102 s | 102 s |
+| GPU busy per step, 70K trace | 28.8 ms (8.3 / 7.9 / 12.6) | 38.3 ms (11.1 / 10.8 / 16.5) |
+
+Per device per step at 70K: `q8a_gemv` 1.8 ms (130 launches, 13.5 µs each ≈ 1.1 TB/s), `moea_q4k` 1.0 ms (16 × 64 µs ≈
+1.0 TB/s), `moea_q51` 0.5 ms (15 × 35 µs ≈ 1.2 TB/s), `mul_mat_vec_f` 0.6 ms (72 tiny F32 matmuls), `q8a_quantize`
+0.33 ms (166 launches), radix top-k 0.35 ms on the QSA device, no sort. The biggest remaining buckets are the ~1000
+small kernels per device (~3.6 ms "other" + cpy/binbcast/norm/unary ≈ 40% of GPU time) and the host/transfer gaps
+(step ≈ 42 ms at 70K vs 28.8 ms of GPU work).
+
 | # | Change | Files | Measured |
 |---|---|---|---|
 | 18 | `q8a` v2: rows-per-warp is a template parameter (1–4), the R weight loads of an iteration are issued together; the (R, K-splits) plan per shape comes from a measured table (`q8a_measured`, built with `next/tools/bench/q8a_test2` + `sweep2.sh`), overridable at runtime with `$NEXT_OPT_DIR/q8a_plans` (`N K B R splitk` per line) and for experiments with `NEXT_Q8A_RPW` / `NEXT_Q8A_SPLITK`; `NEXT_Q8A_VERBOSE=1` logs the plan per shape. A first analytical wave-quantization model was wrong (partial last waves cost far less than a full wave), hence the table | `ggml/src/ggml-cuda/q8a.cu` | sweep with the SM clock pinned (min of 7×100 graph evaluations), best plan vs the v5 rule (R=2): 2560×6144 B=5 23.0 → 21.0 µs (R=3), B=4 22.1 → 19.0 (R=3, 4 splits); 2560×12288 B=4 36.6 → 33.7, B=5 37.9 → 35.9 (R=3); 2560×10240 B=5 31.5 → 29.2 (R=4), B=1 21.9 → 19.8 (R=1, 4 splits); 2560×2560 B=5 28.8 → 17.0 (R=4, 4 splits: the rule left the GPU half empty); N=320/640 rows 10–14% (R=1); K=6144 shapes unchanged. 22 table entries, everything else keeps the rule |
