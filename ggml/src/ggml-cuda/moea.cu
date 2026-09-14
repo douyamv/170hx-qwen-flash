@@ -245,7 +245,8 @@ bool ggml_cuda_moea_supported(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t K = src0->ne[0], N = src0->ne[1];
     if (src0->ne[3] != 1 || K < 256) return false;
     if (src0->type == GGML_TYPE_Q4_K && (K % 256 != 0 || N % 4 != 0)) return false;
-    if (src0->type == GGML_TYPE_Q4_K && !(fusion && fusion->gate)) return false;   // unfused Q4_K: mmvq is as fast
+    // unfused Q4_K is no faster than mmvq, but it is kept on this path so the numerics do not depend on whether the
+    // scheduler happened to fuse up/gate/swiglu (fusion depends on node order, which differs between device splits)
     if (src0->type == GGML_TYPE_Q5_1 && (K % 32 != 0 || N % 8 != 0)) return false;
     if ((src1->ne[1] != 1 && src1->ne[1] != ids->ne[0]) || src1->ne[3] != 1 || src1->ne[2] > MOEA_MAX_TOK) return false;   // shared or per-slot activations
     if (src1->nb[0] != sizeof(float)) return false;
