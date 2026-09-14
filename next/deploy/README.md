@@ -83,6 +83,21 @@ A/B on production with the runtime kill files. Observed: with `moea` on, moving 
 GPU changed the mini's stream after 11 tokens while every other feature was placement-invariant — the kernel itself is
 bitwise deterministic across GPUs and runs; the flip is a near-tie amplified by a placement-dependent ulp difference.
 
+
+## Swapping the model for a variant with the same quantization layout
+
+Any GGUF whose tensor list (names, types, dims) matches the Unsloth UD-Q4_K_XL layout is a drop-in for this
+deployment (same VRAM, same kernels); `../tools/check_struct.py` compares a download with the base shard by shard
+(sizes must be compared with the Hub API's exact `lfs.size`, the headers may be a few hundred bytes longer). The MTP
+draft has no counterpart in such repos: keep the base draft layer and rebuild its Q4 head from the new model's
+`output.weight` (`../tools/after_dl.sh` generates the `make_mtp_q4head_*` / `make_mini_*` variants, builds the 4-layer
+mini and smoke-tests it), then switch `--model` / `--spec-draft-model` in `launch.json` and restart. Done on
+2026-09-14 for `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF` (opt-v7).
+
+Downloading 100 GB through `hf-mirror.com` from this network: the mirror redirects to Hugging Face's xet CDN, which
+throttles many-connection clients (aria2c bursts to ~100 MB/s, then collapses below 1 MB/s and stays there); one
+`curl -L -C -` stream per shard holds 10–22 MB/s, about 30 MB/s in total (`../tools/dl_huihui.sh`).
+
 ## Validation before restarting production
 
 A load takes ~29 minutes, so nothing goes live untested:
