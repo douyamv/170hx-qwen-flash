@@ -11,6 +11,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-trace-local.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -1486,6 +1487,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        llama_trace_local trace_p("SPEC_PROCESS");
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1604,6 +1606,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        llama_trace_local trace_d("SPEC_DRAFT");
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1677,7 +1680,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                { llama_trace_local trace_s("SPEC_DRAFT_SAMPLE"); common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true); }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);

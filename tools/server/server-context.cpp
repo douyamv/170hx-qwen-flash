@@ -1,3 +1,4 @@
+#include "../../src/llama-trace-local.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -2044,6 +2045,7 @@ private:
     }
 
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
+        llama_trace_local trace_send("SRV_SEND");
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
@@ -3026,6 +3028,7 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            llama_trace_local trace_drf("SRV_DRAFT");
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
@@ -3615,6 +3618,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        llama_trace_local trace_ck("SRV_CKPT");
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
                 }
@@ -3662,12 +3666,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        {
+        llama_trace_local trace_dec("SRV_DECODE");
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        }
 
         if (ret != 0) {
             {
@@ -3837,6 +3844,7 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
+                llama_trace_local trace_smp("SRV_SAMPLE");
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
@@ -3892,6 +3900,7 @@ private:
 
             // verify and try to accept the draft
             {
+                llama_trace_local trace_acc("SRV_ACCEPT");
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
