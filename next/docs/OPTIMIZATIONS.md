@@ -51,6 +51,21 @@ GPU kernels 46 ms of a ~52 ms step (89%); host ~6 ms.
 | 16 | `moea` v3: expert-grouped MoE GEMV (`mul_mat_id`, ≤ 8 tokens). `mm_ids_helper` groups the (token, slot) pairs per expert; a compact list of active experts sizes the grid (with 512 experts and 5 tokens, 90% of the per-expert blocks used to exit empty); a warp owns 4 rows (Q4_K, 8 lanes per row, 16-byte loads) or 8 rows (Q5_1, 4 lanes per row, 8-byte loads) and processes the expert's tokens 2 per pass, so the kernels stay at 80 registers (3 blocks/SM). Activations are quantized once per column to int8 with an fp32 {scale, sum} per 32-block (per token for up/gate, per (token, slot) for down); fused up·silu(gate). Unfused Q4_K stays on mmvq (no gain there). Off: `NEXT_MOEA=0` at startup or the runtime file `$NEXT_OPT_DIR/moea_off` | `ggml/src/ggml-cuda/moea.{cu,cuh}`, `mmvq.cu` | on the real experts of the model (mini GGUF layers 1/3, T=5): up/gate+swiglu 212 → 185 µs graph, same error as mmvq (mean rel 1.77e-2 vs the FP32 reference for both); down (Q5_1) error halved (1.14e-2 vs 2.34e-2: exact int block sums instead of fp16). Synthetic E=64/128: Q4_K gate T=5 134 → 101 µs, T=8 218 → 136; Q5_1 T=5 96 → 73, T=8 139 → 89. v1/v2 (8 tokens preloaded, 120 regs, 2 rows/warp) were 1.5–10× slower than mmvq: register pressure + wave quantization, found with `ncu` |
 | 17 | mmvf for F32/F16 weights with N ≤ 64 (GDN β/α projections went through cuBLAS TF32 + split-K) | `ggml/src/ggml-cuda/mmvf.cu` | 2 launches → 1 per projection, full FP32 |
 
+## Phase D (opt-v6, 2026-09-14)
+
+| # | Change | Files | Measured |
+|---|---|---|---|
+| 18 | `q8a` v2: rows-per-warp is a template parameter (1–4), the R weight loads of an iteration are issued together; the (R, K-splits) plan per shape comes from a measured table (`q8a_measured`, built with `next/tools/bench/q8a_test2` + `sweep2.sh`), overridable at runtime with `$NEXT_OPT_DIR/q8a_plans` (`N K B R splitk` per line) and for experiments with `NEXT_Q8A_RPW` / `NEXT_Q8A_SPLITK`; `NEXT_Q8A_VERBOSE=1` logs the plan per shape. A first analytical wave-quantization model was wrong (partial last waves cost far less than a full wave), hence the table | `ggml/src/ggml-cuda/q8a.cu` | Q8A_V2_NUMBERS |
+| 19 | top-k without the final in-block sort (`NEXT_TOPK_NOSORT=1`): `ggml_top_k` promises no order and the QSA consumers (gather + mask select) are order-independent; the sort existed only to be bit-identical to the argsort fallback | `ggml/src/ggml-cuda/top-k.cu` | 4 × 92 µs per device per step at 70K (k = 2051 → the 4096-element bitonic sort ran on one SM per row) |
+| 20 | asynchronous graph-input uploads in the scheduler (`NEXT_SCHED_ASYNC_INPUTS=1`): pinned host inputs go through `ggml_backend_tensor_set_async` instead of copy + per-tensor stream synchronize (llama.cpp never rewrites an input before the graph that reads it has completed) | `ggml/src/ggml-backend.cpp` | ASYNC_NUMBERS |
+| 21 | runtime A/B switches without a reload: `$NEXT_OPT_DIR/moea_off` (moea → mmvq; the CUDA graph is re-captured), `$NEXT_OPT_DIR/q8a_plans` | `moea.cu`, `q8a.cu` | — |
+
+Diagnostics that drove Phase D: `ncu` (needs `sudo` on this box: `ERR_NVGPUCTRPERM`) on `moea_test` showed the v1/v2
+kernels at 25% theoretical occupancy (120 registers), 0.76 eligible warps per scheduler and 18 waves of mostly empty
+blocks; `an_host.py` on the CUPTI trace showed ~320 `cudaStreamSynchronize` and ~114 `cudaMemcpyAsync` per step
+(per-tensor input uploads for 3 devices + 4 MTP steps) and ~6 MB/step of H2D at 70K; `LLAMA_GRAPH_RESULT_DEBUG=1`
+showed llama's graph reuse working (132 of 136 decodes on the mini), so host time is not graph building.
+
 Mini model end-to-end (4 layers, one GPU, ms per generated token, greedy, no MTP): baseline 12.85 (2K) / 14.66 (16K);
 Phase C 11.07 (2K) / 12.73 (16K) → −13%. The mini has one QSA layer and one GPU, so its numbers understate the
 production gain from 4 QSA layers per GPU and 5-row MTP batches.
