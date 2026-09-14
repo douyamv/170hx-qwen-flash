@@ -90,6 +90,15 @@ small kernels per device (~3.6 ms "other" + cpy/binbcast/norm/unary ≈ 40% of G
 | 22 | SM clock pinned at 1410 MHz (`nvidia-smi -lgc 1410,1410` in `ExecStartPre`): `nvidia-smi` sampled during a decode showed GPUs 0/1/3 at 1140 MHz with 20–35% utilization each — the governor never boosts a GPU that idles two thirds of every step | systemd unit | the same cold 200-token request 44.4 → 70.5 tok/s (identical tokens); `prod_sweep` numbers (sustained, already boosted) unchanged: 2K greedy 4/q4 75.3, 70K 71.3 |
 | 21 | runtime A/B switches without a reload: `$NEXT_OPT_DIR/moea_off` (moea → mmvq; the CUDA graph is re-captured), `$NEXT_OPT_DIR/q8a_plans` | `moea.cu`, `q8a.cu` | — |
 
+### opt-v6.1 (2026-09-14 13:32, lib-new22 + launch.json.v5)
+
+opt-v6 + `--spec-draft-backend-sampling` (the MTP draft's top-k sampling on the GPU instead of a 1 MB logits copy and a CPU
+softmax per draft step; validated on the mini: target streams identical) + host-timeline markers (`llama_trace_local`
+RAII markers in `llama_context::{set_inputs, graph_compute, synchronize}`, the server's decode / accept / draft /
+checkpoint / send phases and the MTP driver's process / draft / sample) + a markers-only mode of the CUPTI tracer
+(`touch $NEXT_TRACE_FLAG.cpu`: 15 s of CPU markers with no activity tracing, so the host timeline is not inflated) +
+`opt/spec_adaptive_off` (see row 15). Numbers: V61_NUMBERS
+
 Diagnostics that drove Phase D: `ncu` (needs `sudo` on this box: `ERR_NVGPUCTRPERM`) on `moea_test` showed the v1/v2
 kernels at 25% theoretical occupancy (120 registers), 0.76 eligible warps per scheduler and 18 waves of mostly empty
 blocks; `an_host.py` on the CUPTI trace showed ~320 `cudaStreamSynchronize` and ~114 `cudaMemcpyAsync` per step
