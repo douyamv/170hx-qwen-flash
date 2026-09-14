@@ -97,7 +97,16 @@ softmax per draft step; validated on the mini: target streams identical) + host-
 RAII markers in `llama_context::{set_inputs, graph_compute, synchronize}`, the server's decode / accept / draft /
 checkpoint / send phases and the MTP driver's process / draft / sample) + a markers-only mode of the CUPTI tracer
 (`touch $NEXT_TRACE_FLAG.cpu`: 15 s of CPU markers with no activity tracing, so the host timeline is not inflated) +
-`opt/spec_adaptive_off` (see row 15). Numbers: V61_NUMBERS
+`opt/spec_adaptive_off` (see row 15). Numbers (same prompts as opt-v6): 2K greedy 4/q4 102.1 (unchanged), **70K greedy 4/q4 89.2 tok/s (opt-v6 81.4)** — the
+GPU-sampled draft stops earlier when unsure (267 drafted / 210 accepted = 79% vs 351 / 210 = 60%), 200K greedy 54.4
+(opt-v6 59.6; different acceptance 57% vs 61% on that run — not a like-for-like A/B, the flag is startup-only).
+Host timeline (markers only, 70K / 200K, ms per step of 37.8 / 48.3): the target decode 20.7 / 28.2 of which
+`SET_INPUTS` 0.5 / 2.2, `QSA_CPU_INPUT` 0.24 / 1.1 and 17.5 / 18.4 inside `ggml_backend_sched_graph_compute_async`
+(the host blocks there at both device boundaries: no P2P, the cross-device copy is a blocking host-staged memcpy after a
+device synchronize); then 9.3 / 9.4 ms waiting for the last GPU, the draft catch-up decode 1.0 / 2.25, four draft
+decodes 4.3 / 6.1 (≈ 0.9 / 1.5 each incl. their GPU time), and 45 `llama_synchronize` calls per step (every
+`*_ith` getter synchronizes three CUDA streams). Host-only work is therefore ~6 ms per step at 70K and ~9 ms at 200K;
+the rest of the non-GPU time is the serial dependency chain target → catch-up → 4 drafts → target.
 
 Diagnostics that drove Phase D: `ncu` (needs `sudo` on this box: `ERR_NVGPUCTRPERM`) on `moea_test` showed the v1/v2
 kernels at 25% theoretical occupancy (120 registers), 0.76 eligible warps per scheduler and 18 waves of mostly empty
