@@ -78,8 +78,19 @@ the reason llama.cpp fits where the vLLM/SGLang recipes (which keep a 51–102 G
 
 ## Upstreaming
 
-The plan to contribute the reusable parts back to llama.cpp, split into small PRs, is in
-[next/docs/UPSTREAMING.md](next/docs/UPSTREAMING.md).
+Five self-contained pieces are open as pull requests against [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+(compiled together on upstream `master`, `test-backend-ops` TOP_K/ARGSORT/MUL_MAT all green on a CMP 170HX):
+
+| PR | What |
+|---|---|
+| [#28871](https://github.com/ggml-org/llama.cpp/pull/28871) | CUDA: deterministic radix select for `top_k` when `cub::DeviceTopK` is unavailable (+ test cases) |
+| [#28872](https://github.com/ggml-org/llama.cpp/pull/28872) | llama: keep the backend scheduler on re-reserve instead of recreating it |
+| [#28873](https://github.com/ggml-org/llama.cpp/pull/28873) | kv-cache: honor `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` in `state_write` / `state_read_sinfo` |
+| [#28874](https://github.com/ggml-org/llama.cpp/pull/28874) | ggml-backend: copy user inputs before cross-device inputs in `compute_splits` |
+| [#28875](https://github.com/ggml-org/llama.cpp/pull/28875) | CUDA: use mmvf for tiny-N F32/F16 weights at decode batch sizes |
+
+The plan for the rest (aligned GEMV layouts, the MoE kernel, the `qwen4exp` graph work) is in
+[next/docs/UPSTREAMING.md](next/docs/UPSTREAMING.md); the per-feature patches are in [next/upstream](next/upstream).
 
 ## Credits
 

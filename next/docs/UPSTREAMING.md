@@ -19,8 +19,8 @@ upstream versions should use existing mechanisms (env vars already used by ggml-
 | 1 deterministic radix top-k (+ `test-backend-ops` cases `[70000×{1,5}]`, k=2051) | `pr/cuda-deterministic-radix-topk` | [ggml-org/llama.cpp#28871](https://github.com/ggml-org/llama.cpp/pull/28871) |
 | 2 keep the backend scheduler on re-reserve | `pr/llama-keep-sched-on-rereserve` | [ggml-org/llama.cpp#28872](https://github.com/ggml-org/llama.cpp/pull/28872) |
 | 3 honor `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` in the KV cache | `pr/kv-cache-honor-partial-only` | [ggml-org/llama.cpp#28873](https://github.com/ggml-org/llama.cpp/pull/28873) |
-| 4 user inputs before cross-device inputs in `compute_splits` | `pr/sched-user-inputs-first` | opening (GitHub rate-limits PR creation for new accounts; retried automatically) |
-| 5 mmvf for tiny-N F32/F16 weights | `pr/mmvf-tiny-n-f32` | opening |
+| 4 user inputs before cross-device inputs in `compute_splits` | `pr/sched-user-inputs-first` | [ggml-org/llama.cpp#28874](https://github.com/ggml-org/llama.cpp/pull/28874) |
+| 5 mmvf for tiny-N F32/F16 weights | `pr/mmvf-tiny-n-f32` | [ggml-org/llama.cpp#28875](https://github.com/ggml-org/llama.cpp/pull/28875) |
 
 All five were compiled together on upstream `master` (ad6c668, static CUDA build, sm_80) and checked with
 `test-backend-ops -o TOP_K` (529/529), `-o ARGSORT` (98/98) and `-o MUL_MAT` (1297/1297) on a CMP 170HX.
