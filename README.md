@@ -37,7 +37,7 @@ on the mini model before deployment. Details, measurements and file pointers: [n
 | Area | Change | Effect |
 |---|---|---|
 | CUDA GEMV | `q8a`: Q8_0/Q4_0 weights repacked once into a 16-byte-aligned split layout (int8 quants + fp16 scales) and a dp4a GEMV for decode batches ≤ 8 | dense projections 450 → 650–1000 GB/s; Q4_0 draft head 601 → 318 µs |
-| CUDA MoE | `moea`: expert-grouped GEMV for `mul_mat_id` (Q4_K up/gate with fused SwiGLU, Q5_1 down), tokens sharing an expert read it once | under validation |
+| CUDA MoE | `moea`: expert-grouped GEMV for `mul_mat_id` (Q4_K up/gate with fused SwiGLU, Q5_1 down): only experts that received tokens get blocks, a warp streams 4 (Q4_K) / 8 (Q5_1) rows with 16/8-byte loads, tokens sharing an expert read it once (2 per pass), int8 activations with fp32 per-32 scale+sum | 1.3–1.6× faster than mmvq on the real experts (Q4_K up/gate T=5 134 → 101 µs, T=8 218 → 136; Q5_1 down T=5 96 → 73), same error as mmvq for Q4_K and 2× lower for Q5_1 |
 | CUDA top-k | deterministic radix select for `GGML_OP_TOP_K` (bit-identical to the argsort fallback incl. ties) + batched top-k over all query rows | QSA top-k 0.66 → 0.16 ms (70K), 2.1 → 0.18 ms (262K) per layer |
 | CUDA fused ops | hyper-connection mix tail and combine (13 kernels → 2 per block, 2 blocks per layer); fused gather+dequant+cast for the QSA compact path; `rms_norm+mul` in fusable form | ~1,300 fewer kernel launches per step |
 | MoE prefill | MMQ tile grid sized by the busiest expert instead of the token count | prefill +20% |
