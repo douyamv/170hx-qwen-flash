@@ -9,11 +9,12 @@
 #include <cmath>
 #include <random>
 #include <vector>
+#include <algorithm>
 int main() {
     ggml_backend_t be = ggml_backend_cuda_init(0);
     struct C { int K, N, E, U, T; ggml_type t; bool gate; };
     std::vector<C> cases = {{2560, 640, 64, 10, 5, GGML_TYPE_Q4_K, false}, {2560, 640, 64, 10, 5, GGML_TYPE_Q4_K, true}, {640, 2560, 64, 10, 5, GGML_TYPE_Q5_1, false},
-                            {2560, 640, 64, 10, 1, GGML_TYPE_Q4_K, true}, {640, 2560, 64, 10, 1, GGML_TYPE_Q5_1, false}, {2560, 640, 512, 10, 5, GGML_TYPE_Q4_K, true}, {640, 2560, 512, 10, 5, GGML_TYPE_Q5_1, false}};
+                            {2560, 640, 64, 10, 1, GGML_TYPE_Q4_K, true}, {640, 2560, 64, 10, 1, GGML_TYPE_Q5_1, false}, {2560, 640, 128, 10, 8, GGML_TYPE_Q4_K, true}, {640, 2560, 128, 10, 8, GGML_TYPE_Q5_1, false}};
     for (const C & c : cases) {
         std::mt19937 rng(11); std::normal_distribution<float> nd(0.f, 1.f);
         const size_t nw = (size_t) c.K * c.N * c.E;

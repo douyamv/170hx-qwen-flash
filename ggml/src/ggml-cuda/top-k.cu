@@ -325,6 +325,10 @@ static void top_k_radix_cuda(
     top_k_radix_count<BLOCK_SIZE><<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts, ncols, blocks_per_row);
     top_k_radix_block_offsets<<<nrows, 32, 0, stream>>>(counts, blocks_per_row);
     top_k_radix_gather<BLOCK_SIZE><<<row_grid, BLOCK_SIZE, 0, stream>>>(src, dst, states, counts, ncols, k, blocks_per_row);
+    // ggml_top_k does not promise an order; the sort only makes the result identical to the argsort fallback.
+    // NEXT_TOPK_NOSORT=1 skips it (the QSA gather and mask consumers are order-independent).
+    static const bool nosort = getenv("NEXT_TOPK_NOSORT") != nullptr;
+    if (nosort) return;
     if (k <= 1024) {
         top_k_sort_rows<1024, 256><<<nrows, 256, 0, stream>>>(src, dst, ncols, k);
     } else if (k <= 4096) {

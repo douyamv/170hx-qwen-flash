@@ -1,23 +1,45 @@
 #include "moea.cuh"
 #include "mmid.cuh"
+#include <string>
+#include <sys/stat.h>
 
+// NEXT: expert-grouped decode GEMV for mul_mat_id (v3).
+//  * activations are quantized once per token to int8 with a per-32 (scale, sum) pair;
+//  * only experts that received tokens get thread blocks (compact expert list);
+//  * a warp owns 4 (Q4_K) / 8 (Q5_1) consecutive rows of one expert: each 8-lane (4-lane) group streams its row with
+//    16-byte (8-byte) loads, so the whole warp keeps 32 independent loads in flight per iteration;
+//  * tokens of an expert are processed 2 per pass so the register footprint stays small (<= 85 regs, 3 blocks/SM).
 #define MOEA_MAX_TOK 8
 
-// opt-in (NEXT_MOEA=1): correct, but not yet faster than mmvq on the CMP 170HX (register pressure in the Q4_K path)
+// NEXT_MOEA=0 disables the path at startup; $NEXT_OPT_DIR/moea_off (checked about once per second) disables it at
+// runtime for A/B tests without a reload (the CUDA graph is re-captured when the kernel sequence changes)
 static bool moea_enabled() {
-    static const bool enabled = [] { const char * e = getenv("NEXT_MOEA"); return e != nullptr && atoi(e) != 0; }();
-    return enabled;
+    static const bool enabled = [] { const char * e = getenv("NEXT_MOEA"); return e == nullptr || atoi(e) != 0; }();
+    if (!enabled) return false;
+    static const char * dir = getenv("NEXT_OPT_DIR");
+    if (dir == nullptr) return true;
+    static int64_t last_check = 0;
+    static bool off = false;
+    const int64_t now = ggml_time_ms();
+    if (now - last_check > 1000) {
+        last_check = now;
+        const std::string path = std::string(dir) + "/moea_off";
+        struct stat st;
+        off = stat(path.c_str(), &st) == 0;
+    }
+    return !off;
 }
 
-// activations F32 [K, ntok] (column stride s_col elements) -> int8 [ntok][K], scale [ntok][K/32], int block sums [ntok][K/32]
-static __global__ void moea_quantize(const float * __restrict__ x, const int64_t s_col, int8_t * __restrict__ aq, float * __restrict__ ad,
-        float * __restrict__ asum, const int K) {
+// activations F32 [K, ne11, ntok] -> int8 [ncol][K] + float2 {scale, sum} per 32-block [ncol][K/32], one column per
+// (token, expert slot); ne11 == 1 (up/gate: all experts of a token share the input) gives one column per token
+static __global__ void moea_quantize(const float * __restrict__ x, const int64_t s_slot, const int64_t s_tok, const int ne11,
+        int8_t * __restrict__ aq, float2 * __restrict__ ads, const int K) {
     const int lane = threadIdx.x & 31;
     const int blk  = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
     const int nb   = K >> 5;
     if (blk >= nb) return;
-    const int t = blockIdx.y;
-    const float v = x[(int64_t) t * s_col + blk * 32 + lane];
+    const int t = blockIdx.y;   // column
+    const float v = x[(int64_t) (t / ne11) * s_tok + (int64_t) (t % ne11) * s_slot + blk * 32 + lane];
     float amax = fabsf(v);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
@@ -27,209 +49,188 @@ static __global__ void moea_quantize(const float * __restrict__ x, const int64_t
     int qs = q;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) qs += __shfl_xor_sync(0xffffffff, qs, o);
-    if (lane == 0) { ad[(int64_t) t * nb + blk] = dd; asum[(int64_t) t * nb + blk] = (float) qs; }
+    if (lane == 0) ads[(int64_t) t * nb + blk] = make_float2(dd, (float) qs);
 }
 
-__device__ __forceinline__ int dp4a_sum_bytes(int v) { return __dp4a(v, 0x01010101, 0); }
+// list of experts with at least one token (order irrelevant: every block only writes the rows of its own expert)
+static __global__ void moea_active_experts(const int32_t * __restrict__ bounds, const int n_expert, int32_t * __restrict__ list, int32_t * __restrict__ count) {
+    __shared__ int s_cnt;
+    if (threadIdx.x == 0) s_cnt = 0;
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        if (bounds[e + 1] > bounds[e]) { list[atomicAdd(&s_cnt, 1)] = e; }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) *count = s_cnt;
+}
+
+__device__ __forceinline__ int moea_dot16(const int4 & w, const int4 & a) {
+    int s = __dp4a(w.x, a.x, 0); s = __dp4a(w.y, a.y, s); s = __dp4a(w.z, a.z, s); return __dp4a(w.w, a.w, s);
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Q4_K experts: block = 256 weights = 144 bytes {d, dmin, scales[12], qs[128]}. 8 lanes per block, each lane owns
-// 16 bytes of qs = 16 weights of sub-block 2g (low nibbles) + 16 weights of sub-block 2g+1 (high nibbles), g = group 0..3.
-// A warp covers 4 blocks (1024 weights) per iteration; two rows per warp; up to MOEA_MAX_TOK tokens of the same expert.
+// Q4_K: block = 256 weights = 144 bytes {d, dmin, scales[12], qs[128]}. 8 lanes per row; lane owns 16 bytes of qs =
+// 16 weights of sub-block 2g (low nibbles) + 16 weights of sub-block 2g+1 (high nibbles), g = (lane>>1)&3.
+template <int TG, bool GATE>
+__device__ __forceinline__ void moea_q4k_rows(const char * __restrict__ xr, const char * __restrict__ gr,
+        const int8_t * __restrict__ aq, const float2 * __restrict__ ads, const int * __restrict__ tok,
+        const int nb, const int nbk, const int K, const int lane, float * __restrict__ acc, float * __restrict__ accg) {
+    const int g    = (lane >> 1) & 3;
+    const int hlf  = lane & 1;
+    const int j0   = 2 * g;
+    const bool hi  = j0 >= 4;
+    const int sh   = 8 * (j0 & 3);
+    const float msel = hlf ? 0.f : 1.f;       // the per-sub-block min term is applied once (both lanes share the sum)
+#pragma unroll
+    for (int t = 0; t < TG; ++t) { acc[t] = 0.f; accg[t] = 0.f; }
+#pragma unroll 2
+    for (int kb = 0; kb < nbk; ++kb) {
+        const int ablk = kb * 8 + j0;
+        int4 alo[TG], ahi[TG]; float4 sc[TG];   // sc = {d0, sum0, d1, sum1}
+#pragma unroll
+        for (int t = 0; t < TG; ++t) {
+            const int8_t * a = aq + (size_t) tok[t] * K + (size_t) ablk * 32 + hlf * 16;
+            alo[t] = *reinterpret_cast<const int4 *>(a);
+            ahi[t] = *reinterpret_cast<const int4 *>(a + 32);
+            sc[t]  = *reinterpret_cast<const float4 *>(ads + (size_t) tok[t] * nb + ablk);
+        }
+#pragma unroll
+        for (int which = 0; which < (GATE ? 2 : 1); ++which) {
+            const char * bp = (which == 0 ? xr : gr) + (size_t) kb * 144;
+            const int4 hdr = *reinterpret_cast<const int4 *>(bp);
+            const int4 qv  = *reinterpret_cast<const int4 *>(bp + 16 + g * 32 + hlf * 16);
+            const half2 dm = *reinterpret_cast<const half2 *>(&hdr.x);
+            const float d = __low2float(dm), dmin = __high2float(dm);
+            const uint32_t A = ((uint32_t) hdr.y) >> sh, B = ((uint32_t) hdr.z) >> sh, C = ((uint32_t) hdr.w) >> sh;
+            const int s0 = hi ? (int) ((C & 0xF) | ((A >> 2) & 0x30))          : (int) (A & 63);
+            const int m0 = hi ? (int) (((C >> 4) & 0xF) | ((B >> 2) & 0x30))   : (int) (B & 63);
+            const int s1 = hi ? (int) (((C >> 8) & 0xF) | ((A >> 10) & 0x30))  : (int) ((A >> 8) & 63);
+            const int m1 = hi ? (int) (((C >> 12) & 0xF) | ((B >> 10) & 0x30)) : (int) ((B >> 8) & 63);
+            const int4 lo = make_int4(qv.x & 0x0F0F0F0F, qv.y & 0x0F0F0F0F, qv.z & 0x0F0F0F0F, qv.w & 0x0F0F0F0F);
+            const int4 hv = make_int4((qv.x >> 4) & 0x0F0F0F0F, (qv.y >> 4) & 0x0F0F0F0F, (qv.z >> 4) & 0x0F0F0F0F, (qv.w >> 4) & 0x0F0F0F0F);
+            const float ds0 = d * (float) s0, ds1 = d * (float) s1, dm0 = dmin * (float) m0 * msel, dm1 = dmin * (float) m1 * msel;
+#pragma unroll
+            for (int t = 0; t < TG; ++t) {
+                const float v = sc[t].x * (ds0 * (float) moea_dot16(lo, alo[t]) - dm0 * sc[t].y)
+                              + sc[t].z * (ds1 * (float) moea_dot16(hv, ahi[t]) - dm1 * sc[t].w);
+                if (which == 0) acc[t] += v; else accg[t] += v;
+            }
+        }
+    }
+}
+
 template <bool GATE>
-__global__ void __launch_bounds__(256) moea_q4k(const char * __restrict__ wx, const char * __restrict__ wg,
-        const int8_t * __restrict__ aq, const float * __restrict__ ad, const float * __restrict__ asum,
+__global__ void __launch_bounds__(256, 3) moea_q4k(const char * __restrict__ wx, const char * __restrict__ wg,
+        const int8_t * __restrict__ aq, const float2 * __restrict__ ads,
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
-        float * __restrict__ dst, const int N, const int K, const int n_expert_used, const size_t expert_stride, const size_t row_stride,
-        const int glu_op) {
-    const int e = blockIdx.y;
+        const int32_t * __restrict__ elist, const int32_t * __restrict__ ecount,
+        float * __restrict__ dst, const int N, const int K, const int col_div, const size_t expert_stride, const size_t row_stride) {
+    if ((int) blockIdx.y >= *ecount) return;
+    const int e  = elist[blockIdx.y];
     const int c0 = bounds[e], c1 = bounds[e + 1];
-    const int ntok = c1 - c0;
-    if (ntok <= 0) return;
     const int lane = threadIdx.x & 31;
-    const int warp = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
-    const int n0 = warp * 2;
-    if (n0 >= N) return;
-    const bool has_r1 = n0 + 1 < N;
-    const int nb   = K >> 5;        // 32-wide activation blocks
-    const int nbk  = K >> 8;        // Q4_K blocks per row
-    const int g    = (lane >> 1) & 3;   // 64-weight group within the block
-    const int hlf  = lane & 1;          // which 16-byte half of the group's 32 bytes
-    const int bofs = lane >> 3;         // block offset within the warp's 4-block window
-    int tok[MOEA_MAX_TOK];
+    const int warp = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int row  = warp * 4 + (lane >> 3);
+    if (row >= N) return;                        // N % 4 == 0: warp-uniform
+    const int nb = K >> 5, nbk = K >> 8;
+    const char * xr = wx + (size_t) e * expert_stride + (size_t) row * row_stride;
+    const char * gr = GATE ? wg + (size_t) e * expert_stride + (size_t) row * row_stride : nullptr;
+    for (int t0 = c0; t0 < c1; t0 += 2) {
+        const int ntok = min(2, c1 - t0);
+        int tok[2];
+        tok[0] = ids_dst[t0] / col_div;
+        tok[1] = ntok > 1 ? ids_dst[t0 + 1] / col_div : tok[0];
+        float acc[2] = {0.f, 0.f}, accg[2] = {0.f, 0.f};
+        if (ntok == 2) moea_q4k_rows<2, GATE>(xr, gr, aq, ads, tok, nb, nbk, K, lane, acc, accg);
+        else           moea_q4k_rows<1, GATE>(xr, gr, aq, ads, tok, nb, nbk, K, lane, acc, accg);
 #pragma unroll
-    for (int t = 0; t < MOEA_MAX_TOK; ++t) tok[t] = t < ntok ? ids_dst[c0 + t] / n_expert_used : 0;
-    float acc[2][MOEA_MAX_TOK], accg[2][MOEA_MAX_TOK];
+        for (int t = 0; t < 2; ++t) {
+            float v = acc[t], w = accg[t];
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
-#pragma unroll
-        for (int t = 0; t < MOEA_MAX_TOK; ++t) { acc[r][t] = 0.f; accg[r][t] = 0.f; }
-    const char * xe = wx + (size_t) e * expert_stride;
-    const char * ge = GATE ? wg + (size_t) e * expert_stride : nullptr;
-    for (int kb = bofs; kb < nbk; kb += 4) {
-        const int j0 = 2 * g;                       // sub-block index of the low nibbles
-        const int ablk0 = kb * 8 + j0;              // activation block for sub-block j0 (32-wide)
-        const int ablk1 = ablk0 + 1;
-        // activations for this lane's 16+16 weights, per token
-        int4 alo[MOEA_MAX_TOK], ahi[MOEA_MAX_TOK];
-        float da0[MOEA_MAX_TOK], da1[MOEA_MAX_TOK];
-#pragma unroll
-        for (int t = 0; t < MOEA_MAX_TOK; ++t) {
-            if (t < ntok) {
-                const int8_t * a = aq + (size_t) tok[t] * K;
-                alo[t] = *reinterpret_cast<const int4 *>(a + ablk0 * 32 + hlf * 16);
-                ahi[t] = *reinterpret_cast<const int4 *>(a + ablk1 * 32 + hlf * 16);
-                da0[t] = ad[(size_t) tok[t] * nb + ablk0];
-                da1[t] = ad[(size_t) tok[t] * nb + ablk1];
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            if (r == 1 && !has_r1) break;
-            const int n = n0 + r;
-#pragma unroll
-            for (int which = 0; which < (GATE ? 2 : 1); ++which) {
-                const char * blockp = (which == 0 ? xe : ge) + (size_t) n * row_stride + (size_t) kb * 144;
-                const int4 hdr = *reinterpret_cast<const int4 *>(blockp);            // d, dmin, scales[12]
-                const int4 qv  = *reinterpret_cast<const int4 *>(blockp + 16 + g * 32 + hlf * 16);
-                const half2 dm = *reinterpret_cast<const half2 *>(&hdr.x);
-                const float d = __low2float(dm), dmin = __high2float(dm);
-                const uint8_t * sc = reinterpret_cast<const uint8_t *>(&hdr.y);   // scales[0..11] = bytes 4..15 of hdr
-                int s0, m0, s1, m1;
-                {   // get_scale_min_k4 for j0 (< 4) and j0+1 (< 4): q[j]&63, q[j+4]&63
-                    s0 = sc[j0] & 63; m0 = sc[j0 + 4] & 63;
-                    s1 = sc[j0 + 1] & 63; m1 = sc[j0 + 5] & 63;
-                }
-                // wait: for the second half of sub-blocks (j >= 4) the 6-bit values are packed differently
-                if (j0 >= 4) {
-                    s0 = (sc[j0 + 4] & 0xF) | ((sc[j0 - 4] >> 6) << 4);  m0 = (sc[j0 + 4] >> 4) | ((sc[j0] >> 6) << 4);
-                    s1 = (sc[j0 + 5] & 0xF) | ((sc[j0 - 3] >> 6) << 4);  m1 = (sc[j0 + 5] >> 4) | ((sc[j0 + 1] >> 6) << 4);
-                }
-                const int lx = qv.x & 0x0F0F0F0F, ly = qv.y & 0x0F0F0F0F, lz = qv.z & 0x0F0F0F0F, lw = qv.w & 0x0F0F0F0F;
-                const int hx = (qv.x >> 4) & 0x0F0F0F0F, hy = (qv.y >> 4) & 0x0F0F0F0F, hz = (qv.z >> 4) & 0x0F0F0F0F, hw = (qv.w >> 4) & 0x0F0F0F0F;
-#pragma unroll
-                for (int t = 0; t < MOEA_MAX_TOK; ++t) {
-                    if (t >= ntok) break;
-                    int dlo = 0, dhi = 0;
-                    dlo = __dp4a(lx, alo[t].x, dlo); dlo = __dp4a(ly, alo[t].y, dlo); dlo = __dp4a(lz, alo[t].z, dlo); dlo = __dp4a(lw, alo[t].w, dlo);
-                    dhi = __dp4a(hx, ahi[t].x, dhi); dhi = __dp4a(hy, ahi[t].y, dhi); dhi = __dp4a(hz, ahi[t].z, dhi); dhi = __dp4a(hw, ahi[t].w, dhi);
-                    const int slo = dp4a_sum_bytes(alo[t].x) + dp4a_sum_bytes(alo[t].y) + dp4a_sum_bytes(alo[t].z) + dp4a_sum_bytes(alo[t].w);
-                    const int shi = dp4a_sum_bytes(ahi[t].x) + dp4a_sum_bytes(ahi[t].y) + dp4a_sum_bytes(ahi[t].z) + dp4a_sum_bytes(ahi[t].w);
-                    const float v = d * (da0[t] * (float) (s0 * dlo) + da1[t] * (float) (s1 * dhi))
-                                  - dmin * (da0[t] * (float) (m0 * slo) + da1[t] * (float) (m1 * shi));
-                    if (which == 0) acc[r][t] += v; else accg[r][t] += v;
-                }
-            }
-        }
-    }
-    // reduce across the warp
-#pragma unroll
-    for (int r = 0; r < 2; ++r)
-#pragma unroll
-        for (int t = 0; t < MOEA_MAX_TOK; ++t) {
-            float v = acc[r][t], w = accg[r][t];
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffff, v, o); w += __shfl_xor_sync(0xffffffff, w, o); }
-            acc[r][t] = v; accg[r][t] = w;
-        }
-    if (lane == 0) {
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            if (r == 1 && !has_r1) break;
-            for (int t = 0; t < ntok; ++t) {
-                float v = acc[r][t];
-                if (GATE) {
-                    const float gv = accg[r][t];
-                    v = glu_op == 0 ? v * (gv / (1.0f + expf(-gv))) : v * gv;   // 0: swiglu, else plain product
-                }
-                dst[(size_t) ids_dst[c0 + t] * N + n0 + r] = v;
+            for (int o = 1; o < 8; o <<= 1) { v += __shfl_xor_sync(0xffffffff, v, o); w += __shfl_xor_sync(0xffffffff, w, o); }
+            if ((lane & 7) == 0 && t < ntok) {
+                if (GATE) v = v * (w / (1.0f + expf(-w)));   // x * silu(gate)
+                dst[(size_t) ids_dst[t0 + t] * N + row] = v;
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Q5_1 experts: block = 32 weights = 24 bytes {d, m, qh, qs[16]} (8-byte aligned). One lane per block, two rows per warp.
-__global__ void __launch_bounds__(256) moea_q51(const char * __restrict__ wx,
-        const int8_t * __restrict__ aq, const float * __restrict__ ad, const float * __restrict__ asum,
-        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
-        float * __restrict__ dst, const int N, const int K, const int n_expert_used, const size_t expert_stride, const size_t row_stride) {
-    const int e = blockIdx.y;
-    const int c0 = bounds[e], c1 = bounds[e + 1];
-    const int ntok = c1 - c0;
-    if (ntok <= 0) return;
-    const int lane = threadIdx.x & 31;
-    const int warp = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
-    const int n0 = warp * 2;
-    if (n0 >= N) return;
-    const bool has_r1 = n0 + 1 < N;
-    const int nb = K >> 5;
-    int tok[MOEA_MAX_TOK];
+// Q5_1: block = 32 weights = 24 bytes {d, m, qh, qs[16]} (8-byte aligned). 4 lanes per row (8 rows per warp), one block
+// per lane per iteration.
+__device__ __forceinline__ uint32_t moea_q5_spread(const uint32_t nib) {   // bits 0..3 -> bit 4 of bytes 0..3
+    return ((nib * 0x00204081u) & 0x01010101u) << 4;
+}
+
+template <int TG>
+__device__ __forceinline__ void moea_q51_rows(const char * __restrict__ xr, const int8_t * __restrict__ aq, const float2 * __restrict__ ads,
+        const int * __restrict__ tok, const int nb, const int K, const int l4, float * __restrict__ acc) {
 #pragma unroll
-    for (int t = 0; t < MOEA_MAX_TOK; ++t) tok[t] = t < ntok ? ids_dst[c0 + t] / n_expert_used : 0;
-    float acc[2][MOEA_MAX_TOK];
+    for (int t = 0; t < TG; ++t) acc[t] = 0.f;
+#pragma unroll 2
+    for (int blk = l4; blk < nb; blk += 4) {
+        int4 alo[TG], ahi[TG]; float2 sc[TG];
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
-#pragma unroll
-        for (int t = 0; t < MOEA_MAX_TOK; ++t) acc[r][t] = 0.f;
-    const char * xe = wx + (size_t) e * expert_stride;
-    for (int blk = lane; blk < nb; blk += 32) {
-        int4 alo[MOEA_MAX_TOK], ahi[MOEA_MAX_TOK]; float da[MOEA_MAX_TOK], sa[MOEA_MAX_TOK];
-#pragma unroll
-        for (int t = 0; t < MOEA_MAX_TOK; ++t) {
-            if (t < ntok) {
-                const int8_t * a = aq + (size_t) tok[t] * K + blk * 32;
-                alo[t] = *reinterpret_cast<const int4 *>(a); ahi[t] = *reinterpret_cast<const int4 *>(a + 16);
-                da[t] = ad[(size_t) tok[t] * nb + blk]; sa[t] = asum[(size_t) tok[t] * nb + blk];
-            }
+        for (int t = 0; t < TG; ++t) {
+            const int8_t * a = aq + (size_t) tok[t] * K + (size_t) blk * 32;
+            alo[t] = *reinterpret_cast<const int4 *>(a);
+            ahi[t] = *reinterpret_cast<const int4 *>(a + 16);
+            sc[t]  = ads[(size_t) tok[t] * nb + blk];
         }
+        const char * bp = xr + (size_t) blk * 24;
+        const uint2 h0 = *reinterpret_cast<const uint2 *>(bp);
+        const uint2 q0 = *reinterpret_cast<const uint2 *>(bp + 8);
+        const uint2 q1 = *reinterpret_cast<const uint2 *>(bp + 16);
+        const half2 dm = *reinterpret_cast<const half2 *>(&h0.x);
+        const float d = __low2float(dm), m = __high2float(dm);
+        const uint32_t qh = h0.y;
+        const uint32_t qs[4] = { q0.x, q0.y, q1.x, q1.y };
+        int lo[4], hv[4];
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            if (r == 1 && !has_r1) break;
-            const char * bp = xe + (size_t) (n0 + r) * row_stride + (size_t) blk * 24;
-            const uint2 h0 = *reinterpret_cast<const uint2 *>(bp);          // d,m | qh
-            const uint2 q0 = *reinterpret_cast<const uint2 *>(bp + 8);      // qs[0..7]
-            const uint2 q1 = *reinterpret_cast<const uint2 *>(bp + 16);     // qs[8..15]
-            const half2 dm = *reinterpret_cast<const half2 *>(&h0.x);
-            const float d = __low2float(dm), m = __high2float(dm);
-            const uint32_t qh = h0.y;
-            const int qs[4] = { (int) q0.x, (int) q0.y, (int) q1.x, (int) q1.y };
-            int lo[4], hi[4];
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t qhw = qh >> (4 * w);
+            lo[w] = (int) ((qs[w] & 0x0F0F0F0Fu) | moea_q5_spread(qhw & 0xF));
+            hv[w] = (int) (((qs[w] >> 4) & 0x0F0F0F0Fu) | moea_q5_spread((qhw >> 16) & 0xF));
+        }
+        const int4 lo4 = make_int4(lo[0], lo[1], lo[2], lo[3]), hv4 = make_int4(hv[0], hv[1], hv[2], hv[3]);
 #pragma unroll
-            for (int w = 0; w < 4; ++w) {
-                // low nibbles: weights 4w..4w+3 (bit 4 from qh bits 4w..4w+3); high nibbles: weights 16+4w.. (qh bits 16+4w..)
-                int l = qs[w] & 0x0F0F0F0F, hgh = (qs[w] >> 4) & 0x0F0F0F0F;
-#pragma unroll
-                for (int b = 0; b < 4; ++b) {
-                    l   |= ((qh >> (4 * w + b)) & 1) << (8 * b + 4);
-                    hgh |= ((qh >> (16 + 4 * w + b)) & 1) << (8 * b + 4);
-                }
-                lo[w] = l; hi[w] = hgh;
-            }
-#pragma unroll
-            for (int t = 0; t < MOEA_MAX_TOK; ++t) {
-                if (t >= ntok) break;
-                int s = 0;
-                s = __dp4a(lo[0], alo[t].x, s); s = __dp4a(lo[1], alo[t].y, s); s = __dp4a(lo[2], alo[t].z, s); s = __dp4a(lo[3], alo[t].w, s);
-                s = __dp4a(hi[0], ahi[t].x, s); s = __dp4a(hi[1], ahi[t].y, s); s = __dp4a(hi[2], ahi[t].z, s); s = __dp4a(hi[3], ahi[t].w, s);
-                acc[r][t] += da[t] * (d * (float) s + m * sa[t]);
-            }
+        for (int t = 0; t < TG; ++t) {
+            const int s = moea_dot16(lo4, alo[t]) + moea_dot16(hv4, ahi[t]);
+            acc[t] += sc[t].x * (d * (float) s + m * sc[t].y);
         }
     }
+}
+
+__global__ void __launch_bounds__(256, 3) moea_q51(const char * __restrict__ wx,
+        const int8_t * __restrict__ aq, const float2 * __restrict__ ads,
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
+        const int32_t * __restrict__ elist, const int32_t * __restrict__ ecount,
+        float * __restrict__ dst, const int N, const int K, const int col_div, const size_t expert_stride, const size_t row_stride) {
+    if ((int) blockIdx.y >= *ecount) return;
+    const int e  = elist[blockIdx.y];
+    const int c0 = bounds[e], c1 = bounds[e + 1];
+    const int lane = threadIdx.x & 31;
+    const int warp = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int row  = warp * 8 + (lane >> 2);
+    if (row >= N) return;                        // N % 8 == 0: warp-uniform
+    const int nb = K >> 5;
+    const int l4 = lane & 3;
+    const char * xr = wx + (size_t) e * expert_stride + (size_t) row * row_stride;
+    for (int t0 = c0; t0 < c1; t0 += 2) {
+        const int ntok = min(2, c1 - t0);
+        int tok[2];
+        tok[0] = ids_dst[t0] / col_div;
+        tok[1] = ntok > 1 ? ids_dst[t0 + 1] / col_div : tok[0];
+        float acc[2] = {0.f, 0.f};
+        if (ntok == 2) moea_q51_rows<2>(xr, aq, ads, tok, nb, K, l4, acc);
+        else           moea_q51_rows<1>(xr, aq, ads, tok, nb, K, l4, acc);
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
-#pragma unroll
-        for (int t = 0; t < MOEA_MAX_TOK; ++t) {
-            float v = acc[r][t];
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
-            acc[r][t] = v;
-        }
-    if (lane == 0) {
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            if (r == 1 && !has_r1) break;
-            for (int t = 0; t < ntok; ++t) dst[(size_t) ids_dst[c0 + t] * N + n0 + r] = acc[r][t];
+        for (int t = 0; t < 2; ++t) {
+            float v = acc[t];
+            v += __shfl_xor_sync(0xffffffff, v, 1);
+            v += __shfl_xor_sync(0xffffffff, v, 2);
+            if (l4 == 0 && t < ntok) dst[(size_t) ids_dst[t0 + t] * N + row] = v;
         }
     }
 }
@@ -242,8 +243,11 @@ bool ggml_cuda_moea_supported(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_1) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1];
-    if (src0->ne[3] != 1 || K % 256 != 0 || K < 256 || N % 2 != 0) return false;   // Q4_K needs whole 256-blocks; Q5_1 fine
-    if (src1->ne[1] != 1 || src1->ne[3] != 1 || src1->ne[2] > MOEA_MAX_TOK) return false;  // one activation column per token
+    if (src0->ne[3] != 1 || K < 256) return false;
+    if (src0->type == GGML_TYPE_Q4_K && (K % 256 != 0 || N % 4 != 0)) return false;
+    if (src0->type == GGML_TYPE_Q4_K && !(fusion && fusion->gate)) return false;   // unfused Q4_K: mmvq is as fast
+    if (src0->type == GGML_TYPE_Q5_1 && (K % 32 != 0 || N % 8 != 0)) return false;
+    if ((src1->ne[1] != 1 && src1->ne[1] != ids->ne[0]) || src1->ne[3] != 1 || src1->ne[2] > MOEA_MAX_TOK) return false;   // shared or per-slot activations
     if (src1->nb[0] != sizeof(float)) return false;
     if (ids->ne[1] != src1->ne[2] || ids->nb[0] != sizeof(int32_t)) return false;
     if (!ggml_is_contiguous(dst) || dst->ne[0] != N || dst->ne[1] != ids->ne[0] || dst->ne[2] != src1->ne[2]) return false;
@@ -264,36 +268,40 @@ bool ggml_cuda_mul_mat_moea(ggml_backend_cuda_context & ctx, const ggml_tensor *
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], N = (int) src0->ne[1], n_expert = (int) src0->ne[2];
     const int n_tokens = (int) src1->ne[2], n_expert_used = (int) ids->ne[0];
+    const int ne11 = (int) src1->ne[1];                 // 1: shared per token; n_expert_used: one column per (token, slot)
+    const int n_cols = n_tokens * ne11;
+    const int col_div = ne11 == 1 ? n_expert_used : 1;   // ids_dst = token*n_expert_used + slot -> activation column
     const int nb = K / 32;
-    // per-token activation quantization (all experts of a token share the same input column)
-    ggml_cuda_pool_alloc<int8_t> aq(ctx.pool(), (size_t) n_tokens * K);
-    ggml_cuda_pool_alloc<float>  ad(ctx.pool(), (size_t) n_tokens * nb);
-    ggml_cuda_pool_alloc<float>  as(ctx.pool(), (size_t) n_tokens * nb);
-    moea_quantize<<<dim3((nb + 7) / 8, n_tokens), 256, 0, stream>>>((const float *) src1->data, src1->nb[2] / sizeof(float), aq.get(), ad.get(), as.get(), K);
-    // expert grouping: compact (token, slot) list sorted by expert + bounds
+    ggml_cuda_pool_alloc<int8_t> aq(ctx.pool(), (size_t) n_cols * K);
+    ggml_cuda_pool_alloc<float2> ads(ctx.pool(), (size_t) n_cols * nb);
+    moea_quantize<<<dim3((nb + 7) / 8, n_cols), 256, 0, stream>>>((const float *) src1->data, src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), ne11,
+        aq.get(), ads.get(), K);
+    // expert grouping: compact (token, slot) list sorted by expert + bounds + list of active experts
     const int ne_rows = n_tokens * n_expert_used;
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_rows);
     ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_expert + 1);
+    ggml_cuda_pool_alloc<int32_t> elist(ctx.pool(), n_expert + 1);
     const int si1  = (int) (ids->nb[1] / ids->nb[0]);
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
         n_expert, n_tokens, n_expert_used, (int) src1->ne[1], si1, sis1, false, stream);
-    const int nwarps = (N + 1) / 2;
-    const dim3 grid((nwarps + 7) / 8, n_expert);
+    moea_active_experts<<<1, 1024, 0, stream>>>(bounds.get(), n_expert, elist.get(), elist.get() + n_expert);
+    const int n_active_max = std::min(n_expert, ne_rows);
     const size_t expert_stride = src0->nb[2], row_stride = src0->nb[1];
     if (src0->type == GGML_TYPE_Q4_K) {
-        const bool gate = fusion && fusion->gate;
-        if (gate) {
-            moea_q4k<true><<<grid, 256, 0, stream>>>((const char *) src0->data, (const char *) fusion->gate->data, aq.get(), ad.get(), as.get(),
-                ids_dst.get(), bounds.get(), (float *) dst->data, N, K, n_expert_used, expert_stride, row_stride, 0);
+        const dim3 grid((N + 31) / 32, n_active_max);
+        if (fusion && fusion->gate) {
+            moea_q4k<true><<<grid, 256, 0, stream>>>((const char *) src0->data, (const char *) fusion->gate->data, aq.get(), ads.get(),
+                ids_dst.get(), bounds.get(), elist.get(), elist.get() + n_expert, (float *) dst->data, N, K, col_div, expert_stride, row_stride);
         } else {
-            moea_q4k<false><<<grid, 256, 0, stream>>>((const char *) src0->data, nullptr, aq.get(), ad.get(), as.get(),
-                ids_dst.get(), bounds.get(), (float *) dst->data, N, K, n_expert_used, expert_stride, row_stride, 0);
+            moea_q4k<false><<<grid, 256, 0, stream>>>((const char *) src0->data, nullptr, aq.get(), ads.get(),
+                ids_dst.get(), bounds.get(), elist.get(), elist.get() + n_expert, (float *) dst->data, N, K, col_div, expert_stride, row_stride);
         }
     } else {
-        moea_q51<<<grid, 256, 0, stream>>>((const char *) src0->data, aq.get(), ad.get(), as.get(),
-            ids_dst.get(), bounds.get(), (float *) dst->data, N, K, n_expert_used, expert_stride, row_stride);
+        const dim3 grid((N + 63) / 64, n_active_max);
+        moea_q51<<<grid, 256, 0, stream>>>((const char *) src0->data, aq.get(), ads.get(),
+            ids_dst.get(), bounds.get(), elist.get(), elist.get() + n_expert, (float *) dst->data, N, K, col_div, expert_stride, row_stride);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

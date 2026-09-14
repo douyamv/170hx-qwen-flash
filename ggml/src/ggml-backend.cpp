@@ -1694,12 +1694,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (is_user_input) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                // NEXT: llama.cpp never rewrites a graph input before the graph that reads it has completed (set_inputs
+                // runs after the previous decode synchronized), so the per-tensor stream synchronization here only
+                // serializes the host; with NEXT_SCHED_ASYNC_INPUTS=1 pinned host inputs are uploaded asynchronously
+                static const bool async_inputs = getenv("NEXT_SCHED_ASYNC_INPUTS") != nullptr;
+                if (async_inputs && input->buffer && ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                } else {
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
