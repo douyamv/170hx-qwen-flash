@@ -20,7 +20,7 @@ GPU sampling), 4× CMP 170HX. Decode = generated tokens / second as reported by 
 |---|---|---|---|---|
 | 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** | **85–102 greedy (4/q4 101.9), 71–104 sampled (4/q4 103.9)** |
 | 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** | **70–81 greedy (4/q4 81.4), 56–82 sampled (5/q4 81.9)** |
-| 200K | 27–37 | 35–45 | not yet re-measured (expected 45–55) | not yet measured |
+| 200K | 27–37 | 35–45 | not re-measured | **59.6 greedy (4/q4), 46.6 sampled; 16-token turn TTFT 0.64 s, 3-token 0.39 s; prefill 200K 408 s** |
 | Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s | 0.24–0.43 s |
 | Prefill 70K prompt | 159–186 s | **104 s** | 102 s | 102 s |
 | Full 262K load from USB HDD | ~29 min | ~29 min | same | same |

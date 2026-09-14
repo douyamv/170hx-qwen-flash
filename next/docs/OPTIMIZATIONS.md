@@ -69,6 +69,13 @@ Measured on production right after the deploy (`post10.sh`; opt-v5 numbers in br
 | prefill 70K | 102 s | 102 s |
 | GPU busy per step, 70K trace | 28.8 ms (8.3 / 7.9 / 12.6) | 38.3 ms (11.1 / 10.8 / 16.5) |
 
+200K (probe right after the deploy, `next/tools/validate/prod_200k.py`): prefill 200,014 tokens 408 s; greedy 4/q4 59.6
+tok/s, sampled 46.6; TTFT of a 16-token turn 0.64 s (3-token turn 0.39 s). 200K trace: GPU busy 33.4 ms per step
+(9.1 / 8.8 / 15.5) of a ~57 ms step, i.e. ~24 ms per step are host work and gaps: `QSA_CPU_INPUT` 1.4 ms, ~6 MB of
+per-step H2D (dense `kq_mask` 2 MB per QSA device, `cell_blk`, `bias`), five draft-context decodes (4 drafts + the
+catch-up over the accepted tokens; their dense attention over 200K costs 8 × 189 µs + 1 × 487 µs of `flash_attn`
+alone), sampling readbacks and two device boundaries.
+
 Per device per step at 70K: `q8a_gemv` 1.8 ms (130 launches, 13.5 µs each ≈ 1.1 TB/s), `moea_q4k` 1.0 ms (16 × 64 µs ≈
 1.0 TB/s), `moea_q51` 0.5 ms (15 × 35 µs ≈ 1.2 TB/s), `mul_mat_vec_f` 0.6 ms (72 tiny F32 matmuls), `q8a_quantize`
 0.33 ms (166 launches), radix top-k 0.35 ms on the QSA device, no sort. The biggest remaining buckets are the ~1000
