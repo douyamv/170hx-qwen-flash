@@ -337,6 +337,12 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    // NEXT: the mask that lives on the device of layer il (GPU-generated masks), else the shared one
+    ggml_tensor * get_kq_mask_l(int il) const;
+
+    // NEXT: GPU-generated masks, one per KV buffer type (device); self_pos = I32 [n_batch] token positions feeding them
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_tensor *>> self_kq_mask_dev;
+    ggml_tensor * self_pos = nullptr;
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]

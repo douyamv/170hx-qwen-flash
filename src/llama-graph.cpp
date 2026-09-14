@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "../ggml/src/ggml-qsa.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -471,6 +472,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
+    if (self_pos && self_pos->buffer) {
+        ggml_backend_tensor_set(self_pos, ubatch->pos, 0, ubatch->n_tokens*sizeof(int32_t));
+        mctx->upload_cell_pos();
+    }
+
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
@@ -496,7 +502,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(self_kq_mask ? self_kq_mask : self_kq_mask_cnv, mctx, params.ubatch, params.cparams);
+    res &= self_pos == nullptr || self_pos->ne[0] == params.ubatch.n_tokens;
 
     return res;
 }
@@ -1087,7 +1094,13 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+    if (inp_attn->self_pos && inp_attn->self_pos->buffer) {
+        ggml_backend_tensor_set(inp_attn->self_pos, ubatch->pos, 0, ubatch->n_tokens*sizeof(int32_t));
+        mctx->get_attn()->upload_cell_pos();
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -2763,8 +2776,25 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        if (mctx_cur->device_mask_ok(cparams.causal_attn) && !ubatch.is_pos_2d() && (cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
+            // NEXT: GPU-generated causal masks, one per device holding KV layers (no host fill, no per-step upload)
+            inp->self_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+            ggml_set_input(inp->self_pos);
+            ggml_set_name(inp->self_pos, "attn_inp_mask_pos");
+            const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+            const int64_t n_kv = mctx_cur->get_n_kv();
+            for (const auto & e : mctx_cur->get_cell_pos_list()) {
+                ggml_tensor * cpv = ggml_view_1d(ctx0, e.second, n_kv, 0);
+                ggml_tensor * m = ggml_kq_mask_dev(ctx0, cpv, inp->self_pos, n_kv, ubatch.n_tokens, type);
+                ggml_format_name(m, "attn_kq_mask_dev_%s", ggml_backend_buft_name(e.first));
+                inp->self_kq_mask_dev.emplace_back(e.first, m);
+            }
+            inp->self_kq_mask     = nullptr;
+            inp->self_kq_mask_cnv = inp->self_kq_mask_dev.front().second;
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3844,4 +3874,17 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_l(int il) const {
+    if (self_kq_mask_dev.empty()) {
+        return self_kq_mask_cnv;
+    }
+    ggml_tensor * cp = mctx->get_cell_pos(il);
+    for (const auto & e : self_kq_mask_dev) {
+        if (e.second->src[0]->view_src == cp) {
+            return e.second;
+        }
+    }
+    return self_kq_mask_cnv;
 }

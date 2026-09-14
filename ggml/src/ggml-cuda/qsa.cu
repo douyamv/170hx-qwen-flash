@@ -98,7 +98,28 @@ static __global__ void hc_combine(const char * res, const char * bo, const char 
     const float b  = reinterpret_cast<const float *>(bo + t*bo_stride)[i];
     out[(t*hc + h)*n_embd + i] = r + b*w;
 }
+// NEXT: causal KQ mask from device-resident cell positions: rows >= n_tok (padding) are fully masked
+template <typename T>
+static __global__ void kq_mask_dev(const int32_t * __restrict__ cell_pos, const int32_t * __restrict__ pos, T * __restrict__ out, int64_t n_kv, int64_t n_tok) {
+    const int64_t c = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t t = blockIdx.y;
+    if (c >= n_kv) return;
+    const int cp = cell_pos[c];
+    const bool keep = t < n_tok && cp >= 0 && cp <= pos[t];
+    out[t*n_kv + c] = keep ? T(0.0f) : T(-INFINITY);
+}
 void ggml_cuda_op_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_qsa_kind(dst) == 9) {
+        const auto * cp = dst->src[0]; const auto * ps = dst->src[1];
+        const int64_t n_kv = dst->ne[0], n_rows = dst->ne[1], n_tok = ps->ne[0];
+        const dim3 grid((unsigned)((n_kv + 255)/256), (unsigned) n_rows);
+        if (dst->type == GGML_TYPE_F16) {
+            kq_mask_dev<half><<<grid, 256, 0, ctx.stream()>>>((const int32_t *) cp->data, (const int32_t *) ps->data, (half *) dst->data, n_kv, n_tok);
+        } else {
+            kq_mask_dev<float><<<grid, 256, 0, ctx.stream()>>>((const int32_t *) cp->data, (const int32_t *) ps->data, (float *) dst->data, n_kv, n_tok);
+        }
+        return;
+    }
     if (ggml_qsa_kind(dst) == 5) {
         const auto * xn = dst->src[0]; const auto * gl = dst->src[1];
         const int64_t n_embd = dst->ne[0], nt = dst->ne[1], hc = xn->ne[0]/n_embd;

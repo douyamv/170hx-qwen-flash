@@ -274,6 +274,12 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    // NEXT: one I32 [kv_size, n_stream] cell-position tensor per buffer type (device), see device_mask_ok()
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_tensor * cp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, kv_size, n_stream);
+        ggml_format_name(cp, "cache_cellpos_%s", ggml_backend_buft_name(buft));
+        cell_pos_dev.emplace_back(buft, cp);
+    }
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
         if (hparams.no_alloc) {
@@ -367,6 +373,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    cell_pos_dirty = true;
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -380,6 +387,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    cell_pos_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -449,6 +457,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    cell_pos_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -541,6 +550,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    cell_pos_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -568,6 +578,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    cell_pos_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -618,6 +629,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    cell_pos_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1183,6 +1195,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    update_cell_pos(sinfo, ubatch);
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -1791,6 +1805,76 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+bool llama_kv_cache::device_mask_ok(bool causal_attn) const {
+    static const bool enabled = [] { const char * e = getenv("NEXT_DEVICE_MASK"); return e != nullptr && atoi(e) != 0; }();
+    if (!enabled || !causal_attn || cell_pos_dev.empty()) {
+        return false;
+    }
+    // the GPU rule is "cell used and cell.pos <= token.pos": one stream, one sequence, no SWA, no ALiBi
+    return n_stream == 1 && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi;
+}
+
+ggml_tensor * llama_kv_cache::get_cell_pos(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    const auto & layer = layers[it->second];
+    if (!layer.k || !layer.k->buffer) {
+        return nullptr;
+    }
+    const auto buft = ggml_backend_buffer_get_type(layer.k->buffer);
+    for (const auto & e : cell_pos_dev) {
+        if (e.first == buft) {
+            return e.second;
+        }
+    }
+    return nullptr;
+}
+
+void llama_kv_cache::upload_cell_pos() const {
+    if (!cell_pos_dirty) {
+        return;
+    }
+    const uint32_t kv_size = v_cells[0].size();
+    std::vector<int32_t> host((size_t) kv_size * n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < kv_size; ++i) {
+            host[(size_t) s * kv_size + i] = cells.is_empty(i) ? -1 : cells.pos_get(i);
+        }
+    }
+    for (const auto & e : cell_pos_dev) {
+        if (e.second->data) {
+            ggml_backend_tensor_set(e.second, host.data(), 0, host.size() * sizeof(int32_t));
+        }
+    }
+    cell_pos_dirty = false;
+}
+
+void llama_kv_cache::update_cell_pos(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    if (cell_pos_dirty || cell_pos_dev.empty() || cell_pos_dev[0].second->data == nullptr) {
+        return; // the next upload_cell_pos() rewrites everything
+    }
+    const uint32_t kv_size = v_cells[0].size();
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t strm = sinfo.strm[s];
+        const auto & idxs = sinfo.idxs[s];
+        // contiguous runs of cells -> one tensor_set per run
+        size_t i = 0;
+        while (i < idxs.size()) {
+            size_t j = i + 1;
+            while (j < idxs.size() && idxs[j] == idxs[j - 1] + 1) { j++; }
+            std::vector<int32_t> vals(j - i);
+            for (size_t k = i; k < j; ++k) { vals[k - i] = ubatch.pos[s * sinfo.size() + k]; }
+            for (const auto & e : cell_pos_dev) {
+                ggml_backend_tensor_set(e.second, vals.data(), ((size_t) strm * kv_size + idxs[i]) * sizeof(int32_t), vals.size() * sizeof(int32_t));
+            }
+            i = j;
+        }
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2141,6 +2225,7 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    cell_pos_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2347,6 +2432,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+    cell_pos_dirty = true;
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
