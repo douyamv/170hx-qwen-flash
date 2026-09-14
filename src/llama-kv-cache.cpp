@@ -1811,7 +1811,13 @@ bool llama_kv_cache::device_mask_ok(bool causal_attn) const {
         return false;
     }
     // the GPU rule is "cell used and cell.pos <= token.pos": one stream, one sequence, no SWA, no ALiBi
-    return n_stream == 1 && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi;
+    const bool ok = n_stream == 1 && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi;
+    static const bool verbose = getenv("NEXT_DEVICE_MASK_VERBOSE") != nullptr;
+    if (verbose) {
+        static int printed = 0;
+        if (printed++ < 4) fprintf(stderr, "device_mask_ok: ok=%d n_stream=%u n_seq_max=%u swa=%d alibi=%d tensors=%zu\n", (int) ok, n_stream, n_seq_max, (int) swa_type, (int) hparams.use_alibi, cell_pos_dev.size());
+    }
+    return ok;
 }
 
 ggml_tensor * llama_kv_cache::get_cell_pos(int32_t il) const {

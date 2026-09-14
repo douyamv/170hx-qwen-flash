@@ -2776,7 +2776,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        if (mctx_cur->device_mask_ok(cparams.causal_attn) && !ubatch.is_pos_2d() && (cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
+        if (getenv("NEXT_DEVICE_MASK_VERBOSE")) { static int pr = 0; if (pr++ < 6) fprintf(stderr, "dmask cond: ok=%d pos2d=%d unified=%d n_seqs_unq=%u n_tokens=%u causal=%d\n", (int) mctx_cur->device_mask_ok(cparams.causal_attn), (int) ubatch.is_pos_2d(), (int) cparams.kv_unified, ubatch.n_seqs_unq, ubatch.n_tokens, (int) cparams.causal_attn); }
+        static const int device_mask_level = [] { const char * e = getenv("NEXT_DEVICE_MASK"); return e ? atoi(e) : 0; }();
+        // level 2 also accepts multi-component (M-RoPE) positions: for text tokens the host rule is exactly
+        // cell.pos <= token.pos on the first component (the x/y check only matters for image tokens sharing a position)
+        if (mctx_cur->device_mask_ok(cparams.causal_attn) && (!ubatch.is_pos_2d() || device_mask_level >= 2) && (cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
             // NEXT: GPU-generated causal masks, one per device holding KV layers (no host fill, no per-step upload)
             inp->self_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
             ggml_set_input(inp->self_pos);
@@ -2791,6 +2795,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             }
             inp->self_kq_mask     = nullptr;
             inp->self_kq_mask_cnv = inp->self_kq_mask_dev.front().second;
+            if (getenv("NEXT_DEVICE_MASK_VERBOSE")) { static int printed = 0; if (printed++ < 4) fprintf(stderr, "device mask: %zu masks, n_kv=%lld, n_tokens=%u\n", inp->self_kq_mask_dev.size(), (long long) n_kv, ubatch.n_tokens); }
         } else {
             inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
             inp->self_kq_mask_cnv = inp->self_kq_mask;
