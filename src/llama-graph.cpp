@@ -2792,6 +2792,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                 ggml_tensor * cpv = ggml_view_1d(ctx0, e.second, n_kv, 0);
                 ggml_tensor * m = ggml_kq_mask_dev(ctx0, cpv, inp->self_pos, n_kv, ubatch.n_tokens, type);
                 ggml_format_name(m, "attn_kq_mask_dev_%s", ggml_backend_buft_name(e.first));
+                static const bool dm_check = getenv("NEXT_DEVICE_MASK_CHECK") != nullptr;
+                if (dm_check) {
+                    ggml_set_output(m); // keep the mask alive for the readback check (no memory reuse by later nodes)
+                }
                 inp->self_kq_mask_dev.emplace_back(e.first, m);
             }
             inp->self_kq_mask     = nullptr;
@@ -2813,6 +2817,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    for (const auto & e : inp->self_kq_mask_dev) { ggml_build_forward_expand(gf, e.second); } // NEXT: before the layers (keeps fusion pairs intact)
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3569,6 +3574,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    for (const auto & e : inp_attn->self_kq_mask_dev) { ggml_build_forward_expand(gf, e.second); } // NEXT: before the layers (keeps fusion pairs intact)
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
@@ -3880,6 +3886,46 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+int llm_graph_input_attn_kv::check_dev_masks(const llama_kv_cache_context * kvctx, const llama_ubatch * ubatch, int verbose) const {
+    int bad_total = 0;
+    if (self_kq_mask_dev.empty() || !self_pos) {
+        return 0;
+    }
+    const std::vector<int32_t> cp = kvctx->get_cell_pos_host();
+    const uint32_t n_tokens = ubatch->n_tokens;
+    for (const auto & e : self_kq_mask_dev) {
+        ggml_tensor * m = e.second;
+        const int64_t n_kv = m->ne[0], n_rows = m->ne[1];
+        std::vector<uint8_t> buf(ggml_nbytes(m));
+        ggml_backend_tensor_get(m, buf.data(), 0, buf.size());
+        int bad = 0;
+        for (int64_t t = 0; t < n_rows; ++t) {
+            const llama_pos p1 = t < (int64_t) n_tokens ? ubatch->pos[t] : -1;
+            for (int64_t c = 0; c < n_kv; ++c) {
+                const bool keep_exp = t < (int64_t) n_tokens && c < (int64_t) cp.size() && cp[c] >= 0 && cp[c] <= p1;
+                float got;
+                if (m->type == GGML_TYPE_F16) {
+                    got = ggml_fp16_to_fp32(((const ggml_fp16_t *) buf.data())[t*n_kv + c]);
+                } else {
+                    got = ((const float *) buf.data())[t*n_kv + c];
+                }
+                const bool keep_got = got == 0.0f;
+                if (keep_got != keep_exp || (!keep_got && !(got == -INFINITY))) {
+                    if (bad < 5 && verbose > 1) {
+                        fprintf(stderr, "DM_CHECK mismatch %s: row %lld cell %lld cell_pos %d tok_pos %d got %g expected %s\n", ggml_backend_buft_name(e.first), (long long) t, (long long) c, c < (int64_t) cp.size() ? cp[c] : -2, (int) p1, got, keep_exp ? "0" : "-inf");
+                    }
+                    bad++;
+                }
+            }
+        }
+        if (bad || verbose > 1) {
+            fprintf(stderr, "DM_CHECK %s: n_kv=%lld rows=%lld n_tokens=%u pos[0]=%d mismatches=%d\n", ggml_backend_buft_name(e.first), (long long) n_kv, (long long) n_rows, n_tokens, n_tokens ? (int) ubatch->pos[0] : -1, bad);
+        }
+        bad_total += bad;
+    }
+    return bad_total;
 }
 
 ggml_tensor * llm_graph_input_attn_kv::get_kq_mask_l(int il) const {

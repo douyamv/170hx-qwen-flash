@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-qsa.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -946,6 +947,19 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.inp");
         return cur_backend_id;
+    }
+
+    // NEXT: the device-side KQ mask (custom op kind 9) reads the KV cache's cell-position table, which lives on one
+    // device; run the op there so that neither the table nor the mask has to cross devices in a layer split
+    if (tensor->op == GGML_OP_CUSTOM && ggml_qsa_kind(tensor) == 9 && tensor->src[0] != NULL) {
+        const struct ggml_tensor * base = tensor->src[0]->view_src ? tensor->src[0]->view_src : tensor->src[0];
+        if (base->buffer != NULL && !ggml_backend_buffer_is_host(base->buffer)) {
+            cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, base, tensor);
+            if (cur_backend_id != -1) {
+                SET_CAUSE(tensor, "1.mask");
+                return cur_backend_id;
+            }
+        }
     }
 
     // operations with weights are preferably run on the same backend as the weights

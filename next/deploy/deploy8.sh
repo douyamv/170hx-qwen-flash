@@ -9,7 +9,13 @@ echo "[0] backups"; rm -rf $P/bin.prev7; cp -a $P/bin $P/bin.prev7 && cp -a $P/l
 echo "[1] stop $(date +%T)"; sudo -n systemctl stop qwen38-flashnext-opt-262k.service && echo stopped
 for i in $(seq 1 90); do pgrep -f "llama-server.*--port 8093" >/dev/null || break; sleep 1; done
 pgrep -fa "llama-server" | cut -c1-70 | head -3; nvidia-smi --query-gpu=pci.bus_id,memory.used --format=csv,noheader | tr '\n' ' '; echo
-echo "[2] install libs ($L)"; for f in $L/*.so*; do b=$(basename $f); cp -a $f $P/bin/$b.new && mv -f $P/bin/$b.new $P/bin/$b; done
+echo "[2] install libs ($L)"; df -h / | tail -n 1
+# copy + verify: on a full disk `cp` leaves a truncated .new and the old library silently stays in place (happened on 2026-09-14)
+ok=1; for f in $L/*.so*; do b=$(basename $f)
+  if [ -L $f ]; then cp -a $f $P/bin/$b.new && mv -f $P/bin/$b.new $P/bin/$b
+  else cp $f $P/bin/$b.new && [ "$(md5sum < $f)" = "$(md5sum < $P/bin/$b.new)" ] && mv -f $P/bin/$b.new $P/bin/$b || { echo "COPY FAILED $b"; ok=0; }; fi
+done
+rm -f $P/bin/*.new; [ $ok -eq 1 ] || { echo "INSTALL INCOMPLETE - not starting"; exit 1; }
 for f in libggml-cuda.so.0.22.0 libggml-base.so.0.22.0 libllama.so.0.3.0 libllama-common.so.0.3.0; do echo "$f prod=$(md5sum $P/bin/$f | cut -c1-8) new=$(md5sum $L/$f | cut -c1-8)"; done
 echo "[3] $LJ"; cp -a $P/$LJ $P/launch.json && python3 -c "
 import json; j=json.load(open('$P/launch.json')); a=j['command']; e=j['environment']

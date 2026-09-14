@@ -42,11 +42,15 @@ CUPTI tracer (`../tools/trace/next-trace.cpp`; passive until the flag file exist
 |---|---|
 | `spec_n_max` (int) | MTP draft length, clamped to `--spec-draft-n-max` (4 is the sweet spot here) |
 | `spec_p_min` (float) | draft stop probability |
-| `spec_adaptive_off` (exists) | disable acceptance-adaptive draft length |
+| `spec_adaptive_off` (exists) | disable acceptance-adaptive draft length (present in production: fixed 4 drafts measured best) |
+| `moea_off` (exists) | fall back from the expert-grouped MoE GEMV to `mmvq` |
 | `qsa_min_kv` (int) | context length from which the compact QSA decode path is used (4096) |
 | `hc_fuse_off`, `qsa_gather_unfused`, `qsa_topk_rows`, `mmq_grid_off`, `draft_head_target` (exist) | fall back to the unfused / original code paths |
 
-Environment kill-switches (startup only): `NEXT_Q8A=0`, `NEXT_Q8A_MAX_MB`, `NEXT_MOEA=1` (opt-in), `NEXT_TOPK_SORT=1`,
+Environment switches (startup only): `NEXT_Q8A=0`, `NEXT_Q8A_MAX_MB` (per-tensor cap for the aligned-layout repack, default
+400 MB), `NEXT_MOEA=0` (expert-grouped MoE GEMV is on by default; `moea_off` in `$NEXT_OPT_DIR` switches it off at runtime),
+`NEXT_TOPK_NOSORT=1` (skip the sort of the top-k indices — `ggml_top_k` promises no order; in production since opt-v6),
+`NEXT_DEVICE_MASK=2` (GPU-generated causal KQ mask, opt-v6.2; `NEXT_DEVICE_MASK_VERBOSE=1` logs the decision),
 `NEXT_QSA_NO_BLKCACHE=1`, `NEXT_QSA_PREP_GENERIC=1`, `NEXT_SCHED_RECREATE=1`.
 
 ## GPU clocks (do this first)
@@ -90,3 +94,25 @@ A load takes ~29 minutes, so nothing goes live untested:
    rewind; `validate_all.sh` runs the whole matrix (single GPU, toggles off, 3-GPU split, 2K–200K).
 3. After deployment: `../tools/validate/deploy_monitor2.sh` (short sweep + TTFT probe) and `post4.sh`
    (70K sweep, TTFT, decode trace).
+
+Limits of the mini, learned the hard way:
+
+- Its next-token distribution is almost flat (top-1 and top-2 differ by ~1e-5), so sampled streams flip on ulp-level
+  differences (device placement, GPU vs CPU sampling). Compare CPU-sampling top-k probabilities (`probe_probs.py`,
+  `backend_sampling=false`) for equality claims; sampled streams only catch crashes and gross errors.
+- On the reference machine it shares a 40 GB GPU with production's 28 GB n-gram table and sits ~0.8 GB from the edge.
+  `q8a`'s opportunistic repacks (up to `NEXT_Q8A_MAX_MB` per tensor) can take that headroom, after which the CUDA
+  memory pools fail *later*, inside a decode, with `CUDA error: out of memory` — a change that merely *frees* memory
+  (the device-side mask did) can therefore appear to crash. Pin `NEXT_Q8A_MAX_MB=300` for every mini run, baseline
+  and test alike.
+- Prove that a new path actually runs (CUPTI kernel listing, `GGML_SCHED_DEBUG=1` for placement, a verbose switch)
+  before trusting an equality test: a disabled path passes every comparison.
+- Do not expect bit-identical outputs from a change that only *moves* a computation: ggml-cuda decides some fusions
+  by comparing compute-buffer addresses (`ggml_cuda_check_fusion_memory_ranges`), so a different tensor set shifts
+  allocations and flips fusion decisions here and there (rounding-level), and other address-dependent kernel choices
+  remain even with `GGML_CUDA_DISABLE_FUSION=1`. Verify the moved computation directly (the device mask has
+  `NEXT_DEVICE_MASK_CHECK=1`, a readback that compares every mask entry with the host rule) and compare the residual
+  against the codebase's own reference noise (fusion on/off, dense vs compact path) on the same prompts.
+- `GGML_SCHED_DEBUG` output does not reach the server log; a CUPTI kernel listing per device (`libnext-trace.so`) shows
+  where an op runs. Reading an intermediate tensor back after the graph ran needs `ggml_set_output` on it, otherwise
+  its memory has already been reused.

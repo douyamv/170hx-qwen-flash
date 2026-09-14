@@ -37,6 +37,7 @@
     "draft-mtp",
     "--spec-draft-model",
     "/mnt/slowdisk/AI-archive/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0-q4head.gguf",
+    "--spec-draft-backend-sampling",
     "--spec-draft-n-max",
     "5",
     "--spec-draft-n-min",
@@ -75,7 +76,9 @@
     "NEXT_TRACE_FLAG": "/home/douya/qwen-3.8-next-opt/profile.flag",
     "NEXT_TRACE_LOG": "/home/douya/qwen-3.8-next-opt/logs/profile.csv",
     "LD_LIBRARY_PATH": "/home/douya/qwen-3.8-next-opt/bin",
-    "NEXT_OPT_DIR": "/home/douya/qwen-3.8-next-opt/opt"
+    "NEXT_OPT_DIR": "/home/douya/qwen-3.8-next-opt/opt",
+    "NEXT_TOPK_NOSORT": "1",
+    "NEXT_DEVICE_MASK": "2"
   },
-  "stage": "opt-v3: + radix top-k (batched), GDN l2norm fix (#28068), sched split-input reorder, ubatch 1024, backend sampling default"
+  "stage": "opt-v6.2: opt-v6.1 (radix top-k unsorted, moea, q8a v2, draft GPU sampling, SM clock pin) + GPU-generated causal KQ mask (NEXT_DEVICE_MASK=2)"
 }

@@ -339,6 +339,8 @@ public:
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
     // NEXT: the mask that lives on the device of layer il (GPU-generated masks), else the shared one
     ggml_tensor * get_kq_mask_l(int il) const;
+    // NEXT: debug — compare the GPU masks with the host rule, returns the number of mismatching entries
+    int check_dev_masks(const llama_kv_cache_context * kvctx, const llama_ubatch * ubatch, int verbose) const;
 
     // NEXT: GPU-generated masks, one per KV buffer type (device); self_pos = I32 [n_batch] token positions feeding them
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_tensor *>> self_kq_mask_dev;

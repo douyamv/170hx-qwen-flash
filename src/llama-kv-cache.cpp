@@ -1838,6 +1838,18 @@ ggml_tensor * llama_kv_cache::get_cell_pos(int32_t il) const {
     return nullptr;
 }
 
+std::vector<int32_t> llama_kv_cache::get_cell_pos_host() const {
+    const uint32_t kv_size = v_cells[0].size();
+    std::vector<int32_t> host((size_t) kv_size * n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < kv_size; ++i) {
+            host[(size_t) s * kv_size + i] = cells.is_empty(i) ? -1 : cells.pos_get(i);
+        }
+    }
+    return host;
+}
+
 void llama_kv_cache::upload_cell_pos() const {
     if (!cell_pos_dirty) {
         return;

@@ -8,6 +8,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1407,6 +1408,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // NEXT: debug — verify the GPU-generated KQ masks against the host rule (NEXT_DEVICE_MASK_CHECK=1: summary on
+    // mismatch only, =2: every ubatch + details)
+    static const int dm_check = [] { const char * e = getenv("NEXT_DEVICE_MASK_CHECK"); return e ? atoi(e) : 0; }();
+    if (dm_check) {
+        ggml_backend_sched_synchronize(sched.get());
+        static int64_t n_checked = 0, n_bad_ubatches = 0;
+        int bad = 0;
+        for (const auto & inp : res->inputs) {
+            if (auto * a = dynamic_cast<llm_graph_input_attn_kv *>(inp.get())) {
+                bad += a->check_dev_masks(a->mctx, &ubatch, dm_check);
+            } else if (auto * h = dynamic_cast<llm_graph_input_mem_hybrid *>(inp.get())) {
+                if (h->inp_attn) bad += h->inp_attn->check_dev_masks(h->mctx->get_attn(), &ubatch, dm_check);
+            }
+        }
+        n_checked++;
+        if (bad) n_bad_ubatches++;
+        if (bad || dm_check > 1 || n_checked % 500 == 0) {
+            fprintf(stderr, "DM_CHECK ubatch #%lld n_tokens=%u: %d mismatching entries (bad ubatches so far %lld)\n", (long long) n_checked, ubatch.n_tokens, bad, (long long) n_bad_ubatches);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;

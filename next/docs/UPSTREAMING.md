@@ -98,6 +98,19 @@ the author of the `levers` patches before opening PRs:
    statistics as justification);
 5. strided conv-state store (no `ggml_cont`), `rms_norm+mul` written in the fusable order.
 
+## PR 8 (candidate) — llama: GPU-generated causal KQ mask
+
+- Files: `src/llama-kv-cache.{h,cpp}` (I32 cell-position table per KV buffer type, incremental updates in
+  `apply_ubatch`, dirty flag on structural changes), `src/llama-graph.{h,cpp}` (one mask op per device, I32 position
+  input), a small `ggml` op (keep iff `cell_pos >= 0 && cell_pos <= pos[t]`) with CPU/CUDA implementations, and a
+  scheduler rule that runs the op where its table lives.
+- Why: the host-filled `[n_kv, n_tokens]` F16 mask is rebuilt and uploaded to every device each step (2 MB per QSA
+  device per step at 200K, ~1 GB of pinned + device buffers at `-ub 1024`); at long context it is a measurable part of
+  the per-step host time, and the MTP draft context pays it again for every draft step.
+- Needs before proposing: SWA / ALiBi / multi-sequence support (or an explicit fallback, as here), the M-RoPE 2-D rule
+  for image tokens, and numbers on a mainstream model. Outputs are not bit-identical to the host mask because
+  ggml-cuda's address-based fusion checks see a different buffer layout (see OPTIMIZATIONS row 23).
+
 ## Not proposed
 
 - `moea` (expert-grouped MoE GEMV): correct, but not faster than `mmvq` yet on this GPU; kept off by default.
