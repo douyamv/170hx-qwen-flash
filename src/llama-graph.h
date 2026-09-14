@@ -345,6 +345,7 @@ public:
     // NEXT: GPU-generated masks, one per KV buffer type (device); self_pos = I32 [n_batch] token positions feeding them
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_tensor *>> self_kq_mask_dev;
     ggml_tensor * self_pos = nullptr;
+    ggml_tensor * self_kvs = nullptr; // I32 [n_streams of the ubatch]: mask stream -> KV cache stream
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]

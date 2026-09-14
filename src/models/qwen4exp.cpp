@@ -820,8 +820,8 @@ static ggml_tensor * qsa_compact(ggml_context * ctx, ggml_tensor * q,
     };
     ggml_tensor * kc = nullptr;
     ggml_tensor * vc = nullptr;
-    if (!next_opt_flag("qsa_gather_unfused")) {  // NEXT: fused gather+dequant+cast (see qsa.cu) is the default now
-        auto * ids2 = ggml_reshape_2d(ctx, ggml_cont(ctx, indices), ns, nq);
+    auto * ids2 = ggml_reshape_2d(ctx, ggml_cont(ctx, indices), ns, nq); // rows = n_tps*n_stream, stream-major
+    if (!next_opt_flag("qsa_gather_unfused") || k->ne[3] > 1) {  // NEXT: fused gather+dequant+cast (see qsa.cu) is the default; the only path for several streams
         kc = ggml_qsa_gather_f16(ctx, k, ids2, np);
         vc = ggml_qsa_gather_f16(ctx, v, ids2, np);
     } else {
@@ -829,7 +829,7 @@ static ggml_tensor * qsa_compact(ggml_context * ctx, ggml_tensor * q,
         vc = gather(v);
     }
     // Keep the original mask pointer so the scheduler reuses its device copy.
-    auto * selected_mask = ggml_qsa_mask_select(ctx, mask, indices, np);
+    auto * selected_mask = ggml_qsa_mask_select(ctx, mask, ids2, np);
     auto * qq = ggml_reshape_4d(ctx, ggml_cont(ctx, q), d, q->ne[1], 1, nq);
     qq = ggml_permute(ctx, qq, 0, 2, 1, 3);
     auto * result = ggml_flash_attn_ext(ctx, qq, kc, vc, selected_mask, scale, 0.0f, 0.0f);
@@ -990,7 +990,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 store->nb[1], store->nb[2], store->nb[2]*s0);
         cb(pooled, "indexer_k", il);
     } else {
-    if (getenv("NEXT_QSA_OPT") && n_stream == 1 && n_tps <= 8 && r == 4 && idx_dim == 128 &&
+    if (getenv("NEXT_QSA_OPT") && n_tps <= 8 && r == 4 && idx_dim == 128 && // NEXT: stream-aware kernels
             k_all->type == GGML_TYPE_Q8_0 && model.layers[il].index_k_norm->type == GGML_TYPE_F32 && n_kv >= next_qsa_min_kv()) {
         pooled = ggml_qsa_pool_norm(ctx0, k_all, inp->blk_cells, model.layers[il].index_k_norm, hparams.f_norm_rms_eps);
         cb(pooled, "qsa_pool_norm_fused", il);
@@ -1061,7 +1061,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
 
     ggml_tensor * expanded = nullptr;
-    if (getenv("NEXT_QSA_OPT") && n_stream == 1 && n_tps <= 8 && blk_bias &&
+    if (getenv("NEXT_QSA_OPT") && n_tps <= 8 && blk_bias && // NEXT: stream-aware kernel
             kq_mask->type == GGML_TYPE_F16 && n_kv >= next_qsa_min_kv()) {
         expanded = ggml_qsa_expand(ctx0, score, inp->cell_blk, kq_mask);
     } else {
@@ -1141,11 +1141,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask_l(il);
-    if (getenv("NEXT_QSA_OPT") && n_tokens <= 8 && kq_mask->ne[3] == 1 &&
+    if (getenv("NEXT_QSA_OPT") && n_tokens/kq_mask->ne[3] <= 8 && // NEXT: <= 8 tokens per stream
             kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[0] >= next_qsa_min_kv()) {
         auto * k = mctx_cur->get_k(ctx0, il);
         auto * v = mctx_cur->get_v(ctx0, il);
-        if (k->ne[0] == 256 && v->ne[0] == 256 && k->ne[1] == 2 && v->ne[1] == 2 && k->ne[3] == 1 && v->ne[3] == 1 &&
+        if (k->ne[0] == 256 && v->ne[0] == 256 && k->ne[1] == 2 && v->ne[1] == 2 && k->ne[3] == kq_mask->ne[3] && v->ne[3] == kq_mask->ne[3] &&
                 k->nb[1] == ggml_row_size(k->type, k->ne[0]) && v->nb[1] == ggml_row_size(v->type, v->ne[0])) {
             auto * cur = qsa_compact(ctx0, q_cur, k, v, top_k, kq_mask, kq_scale);
             cb(cur, "qsa_compact_out", il);

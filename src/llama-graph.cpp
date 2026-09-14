@@ -474,6 +474,13 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     if (self_pos && self_pos->buffer) {
         ggml_backend_tensor_set(self_pos, ubatch->pos, 0, ubatch->n_tokens*sizeof(int32_t));
+        if (self_kvs && self_kvs->buffer) {
+            std::vector<int32_t> kvs(self_kvs->ne[0], 0);
+            for (int64_t s = 0; s < self_kvs->ne[0]; ++s) {
+                kvs[s] = self_kvs->ne[0] == 1 && cparams.kv_unified ? 0 : (int32_t) mctx->get_stream_of_seq(ubatch->seq_id_unq[s]);
+            }
+            ggml_backend_tensor_set(self_kvs, kvs.data(), 0, kvs.size()*sizeof(int32_t));
+        }
         mctx->upload_cell_pos();
     }
 
@@ -504,6 +511,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask ? self_kq_mask : self_kq_mask_cnv, mctx, params.ubatch, params.cparams);
     res &= self_pos == nullptr || self_pos->ne[0] == params.ubatch.n_tokens;
+    res &= self_kvs == nullptr || self_kvs->ne[0] == (params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq);
 
     return res;
 }
@@ -1099,6 +1107,13 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     }
     if (inp_attn->self_pos && inp_attn->self_pos->buffer) {
         ggml_backend_tensor_set(inp_attn->self_pos, ubatch->pos, 0, ubatch->n_tokens*sizeof(int32_t));
+        if (inp_attn->self_kvs && inp_attn->self_kvs->buffer) {
+            std::vector<int32_t> kvs(inp_attn->self_kvs->ne[0], 0);
+            for (int64_t s = 0; s < inp_attn->self_kvs->ne[0]; ++s) {
+                kvs[s] = inp_attn->self_kvs->ne[0] == 1 && cparams.kv_unified ? 0 : (int32_t) mctx->get_attn()->get_stream_of_seq(ubatch->seq_id_unq[s]);
+            }
+            ggml_backend_tensor_set(inp_attn->self_kvs, kvs.data(), 0, kvs.size()*sizeof(int32_t));
+        }
         mctx->get_attn()->upload_cell_pos();
     }
 
@@ -1135,6 +1150,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask ? inp_attn->self_kq_mask : inp_attn->self_kq_mask_cnv, mctx->get_attn(), params.ubatch, params.cparams);
     res &= inp_attn->self_pos == nullptr || inp_attn->self_pos->ne[0] == params.ubatch.n_tokens;
+    res &= inp_attn->self_kvs == nullptr || inp_attn->self_kvs->ne[0] == (params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2781,16 +2797,21 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         static const int device_mask_level = [] { const char * e = getenv("NEXT_DEVICE_MASK"); return e ? atoi(e) : 0; }();
         // level 2 also accepts multi-component (M-RoPE) positions: for text tokens the host rule is exactly
         // cell.pos <= token.pos on the first component (the x/y check only matters for image tokens sharing a position)
-        if (mctx_cur->device_mask_ok(cparams.causal_attn) && (!ubatch.is_pos_2d() || device_mask_level >= 2) && (cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
-            // NEXT: GPU-generated causal masks, one per device holding KV layers (no host fill, no per-step upload)
+        if (mctx_cur->device_mask_ok(cparams.causal_attn) && (!ubatch.is_pos_2d() || device_mask_level >= 2) && (!cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
+            // NEXT: GPU-generated causal masks, one per device holding KV layers (no host fill, no per-step upload);
+            // with one KV stream per sequence the mask carries one plane per stream of the ubatch
+            const int64_t n_ns  = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+            const int64_t n_tps = ubatch.n_tokens / n_ns;
             inp->self_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
             ggml_set_input(inp->self_pos);
             ggml_set_name(inp->self_pos, "attn_inp_mask_pos");
+            inp->self_kvs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ns);
+            ggml_set_input(inp->self_kvs);
+            ggml_set_name(inp->self_kvs, "attn_inp_mask_kvs");
             const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
             const int64_t n_kv = mctx_cur->get_n_kv();
             for (const auto & e : mctx_cur->get_cell_pos_list()) {
-                ggml_tensor * cpv = ggml_view_1d(ctx0, e.second, n_kv, 0);
-                ggml_tensor * m = ggml_kq_mask_dev(ctx0, cpv, inp->self_pos, n_kv, ubatch.n_tokens, type);
+                ggml_tensor * m = ggml_kq_mask_dev(ctx0, e.second, inp->self_pos, inp->self_kvs, n_kv, n_tps, n_ns, type);
                 ggml_format_name(m, "attn_kq_mask_dev_%s", ggml_backend_buft_name(e.first));
                 static const bool dm_check = getenv("NEXT_DEVICE_MASK_CHECK") != nullptr;
                 if (dm_check) {
@@ -3897,31 +3918,41 @@ int llm_graph_input_attn_kv::check_dev_masks(const llama_kv_cache_context * kvct
     const uint32_t n_tokens = ubatch->n_tokens;
     for (const auto & e : self_kq_mask_dev) {
         ggml_tensor * m = e.second;
-        const int64_t n_kv = m->ne[0], n_rows = m->ne[1];
+        const int64_t n_kv = m->ne[0], n_tps = m->ne[1], n_ns = m->ne[3];
         std::vector<uint8_t> buf(ggml_nbytes(m));
         ggml_backend_tensor_get(m, buf.data(), 0, buf.size());
+        std::vector<int32_t> kvs(n_ns, 0);
+        if (self_kvs && self_kvs->buffer) {
+            ggml_backend_tensor_get(self_kvs, kvs.data(), 0, kvs.size()*sizeof(int32_t));
+        }
+        // the host table is [kv_size x n_stream]; kv_size = the stride of the device table
+        const int64_t stride = e.second->src[0]->nb[1] / sizeof(int32_t);
         int bad = 0;
-        for (int64_t t = 0; t < n_rows; ++t) {
-            const llama_pos p1 = t < (int64_t) n_tokens ? ubatch->pos[t] : -1;
-            for (int64_t c = 0; c < n_kv; ++c) {
-                const bool keep_exp = t < (int64_t) n_tokens && c < (int64_t) cp.size() && cp[c] >= 0 && cp[c] <= p1;
-                float got;
-                if (m->type == GGML_TYPE_F16) {
-                    got = ggml_fp16_to_fp32(((const ggml_fp16_t *) buf.data())[t*n_kv + c]);
-                } else {
-                    got = ((const float *) buf.data())[t*n_kv + c];
-                }
-                const bool keep_got = got == 0.0f;
-                if (keep_got != keep_exp || (!keep_got && !(got == -INFINITY))) {
-                    if (bad < 5 && verbose > 1) {
-                        fprintf(stderr, "DM_CHECK mismatch %s: row %lld cell %lld cell_pos %d tok_pos %d got %g expected %s\n", ggml_backend_buft_name(e.first), (long long) t, (long long) c, c < (int64_t) cp.size() ? cp[c] : -2, (int) p1, got, keep_exp ? "0" : "-inf");
+        for (int64_t s = 0; s < n_ns; ++s) {
+            for (int64_t t = 0; t < n_tps; ++t) {
+                const int64_t i = s*n_tps + t;
+                const llama_pos p1 = i < (int64_t) n_tokens ? ubatch->pos[i] : -1;
+                for (int64_t c = 0; c < n_kv; ++c) {
+                    const int64_t ci = (int64_t) kvs[s]*stride + c;
+                    const bool keep_exp = i < (int64_t) n_tokens && ci < (int64_t) cp.size() && cp[ci] >= 0 && cp[ci] <= p1;
+                    float got;
+                    if (m->type == GGML_TYPE_F16) {
+                        got = ggml_fp16_to_fp32(((const ggml_fp16_t *) buf.data())[i*n_kv + c]);
+                    } else {
+                        got = ((const float *) buf.data())[i*n_kv + c];
                     }
-                    bad++;
+                    const bool keep_got = got == 0.0f;
+                    if (keep_got != keep_exp || (!keep_got && !(got == -INFINITY))) {
+                        if (bad < 5 && verbose > 1) {
+                            fprintf(stderr, "DM_CHECK mismatch %s: stream %lld row %lld cell %lld cell_pos %d tok_pos %d got %g expected %s\n", ggml_backend_buft_name(e.first), (long long) s, (long long) t, (long long) c, ci < (int64_t) cp.size() ? cp[ci] : -2, (int) p1, got, keep_exp ? "0" : "-inf");
+                        }
+                        bad++;
+                    }
                 }
             }
         }
         if (bad || verbose > 1) {
-            fprintf(stderr, "DM_CHECK %s: n_kv=%lld rows=%lld n_tokens=%u pos[0]=%d mismatches=%d\n", ggml_backend_buft_name(e.first), (long long) n_kv, (long long) n_rows, n_tokens, n_tokens ? (int) ubatch->pos[0] : -1, bad);
+            fprintf(stderr, "DM_CHECK %s: n_kv=%lld n_tps=%lld n_ns=%lld n_tokens=%u pos[0]=%d mismatches=%d\n", ggml_backend_buft_name(e.first), (long long) n_kv, (long long) n_tps, (long long) n_ns, n_tokens, n_tokens ? (int) ubatch->pos[0] : -1, bad);
         }
         bad_total += bad;
     }

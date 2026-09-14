@@ -240,6 +240,7 @@ public:
     const std::vector<std::pair<ggml_backend_buffer_type_t, ggml_tensor *>> & get_cell_pos_list() const { return cell_pos_dev; }
     void upload_cell_pos() const;
     std::vector<int32_t> get_cell_pos_host() const; // NEXT: debug (NEXT_DEVICE_MASK_CHECK)
+    uint32_t get_stream_of_seq(llama_seq_id seq_id) const { return seq_to_stream.at(seq_id); }
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -446,6 +447,7 @@ public:
     const std::vector<std::pair<ggml_backend_buffer_type_t, ggml_tensor *>> & get_cell_pos_list() const { return kv->get_cell_pos_list(); }
     void upload_cell_pos() const { kv->upload_cell_pos(); }
     std::vector<int32_t> get_cell_pos_host() const { return kv->get_cell_pos_host(); }
+    uint32_t get_stream_of_seq(llama_seq_id seq_id) const { return kv->get_stream_of_seq(seq_id); }
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

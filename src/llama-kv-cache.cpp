@@ -1811,7 +1811,8 @@ bool llama_kv_cache::device_mask_ok(bool causal_attn) const {
         return false;
     }
     // the GPU rule is "cell used and cell.pos <= token.pos": one stream, one sequence, no SWA, no ALiBi
-    const bool ok = n_stream == 1 && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi;
+    // one stream per sequence (or a single sequence): every cell of a stream belongs to its sequence
+    const bool ok = ((n_stream == 1 && n_seq_max == 1) || n_stream == n_seq_max) && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi;
     static const bool verbose = getenv("NEXT_DEVICE_MASK_VERBOSE") != nullptr;
     if (verbose) {
         static int printed = 0;

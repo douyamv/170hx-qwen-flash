@@ -98,6 +98,18 @@ Downloading 100 GB through `hf-mirror.com` from this network: the mirror redirec
 throttles many-connection clients (aria2c bursts to ~100 MB/s, then collapses below 1 MB/s and stays there); one
 `curl -L -C -` stream per shard holds 10–22 MB/s, about 30 MB/s in total (`../tools/dl_huihui.sh`).
 
+
+## Several slots (opt-v8)
+
+`--parallel 3 --ctx-size 786432` gives three slots of 262K each; the KV total triples, so the draft model, `token_embd`
+and the output head go to the spare GPU (`--spec-draft-device CUDA3`,
+`--override-tensor "^per_layer_token_embd\.weight$=CUDA3,^token_embd\.weight$=CUDA3,^output\.weight$=CUDA3"` — the three
+must share a device) and each layer GPU pays ≈ 1.5 GB per extra slot. Keep the default per-slot KV streams (do not use
+`--kv-unified` with this fork). The fast paths are stream-aware from lib-new29 on (OPTIMIZATIONS row 24); with several
+slots decoding in the same step the dense GEMVs run on MMQ instead of `q8a`/`moea`. Concurrent agents then keep their own
+prompt caches instead of re-prefilling each other's context on every turn (`--parallel 1` re-prefills a 150K context
+for ~3.5 min at every switch). Tool-call requests with a grammar disable GPU sampling (llama.cpp limitation).
+
 ## Validation before restarting production
 
 A load takes ~29 minutes, so nothing goes live untested:

@@ -12,16 +12,21 @@ static void qsa_cpu(struct ggml_tensor * dst, int ith, int nth, void * userdata)
     float * out = dst->data;
     if (kind == 1) {
         const float * gamma = dst->src[2]->data;
-        for (int64_t b = ith; b < dst->ne[1]; b += nth) {
+        const struct ggml_tensor * idt = dst->src[1];
+        const int64_t n_blocks = dst->ne[1];
+        for (int64_t bs = ith; bs < n_blocks*dst->ne[2]; bs += nth) {
+            const int64_t s = bs / n_blocks, b = bs % n_blocks;
+            const int32_t * ids_s = (const int32_t *)((const char *)idt->data + s*idt->nb[1]);
+            const char * raw_s = (const char *)a->data + s*a->nb[2];
             float x[128] = {0}, row[128];
             for (int j = 0; j < 4; ++j) {
-                dequantize_row_q8_0((const block_q8_0 *)((const char *)a->data + (size_t)ids[b*4+j]*a->nb[1]), row, 128);
+                dequantize_row_q8_0((const block_q8_0 *)(raw_s + (size_t)ids_s[b*4+j]*a->nb[1]), row, 128);
                 for (int d = 0; d < 128; ++d) x[d] += row[d];
             }
             float ss = 0;
             for (int d = 0; d < 128; ++d) { x[d] *= .25f; ss += x[d]*x[d]; }
             const float inv = 1.0f/sqrtf(ss/128 + ggml_qsa_epsilon(dst));
-            for (int d = 0; d < 128; ++d) out[b*128+d] = (x[d]*inv)*gamma[d];
+            for (int d = 0; d < 128; ++d) out[bs*128+d] = (x[d]*inv)*gamma[d];
         }
     } else if (kind == 4) {
         // dst [d, np, nh, nq] F16; src[0] cache [d, nh, nk] Q8_0 rows; src[1] ids [ns, nq]
@@ -30,11 +35,13 @@ static void qsa_cpu(struct ggml_tensor * dst, int ith, int nth, void * userdata)
         ggml_fp16_t * result = dst->data;
         float row[4096];
         GGML_ASSERT(d*nh <= 4096);
+        const int64_t n_str = a->ne[3], n_tps = dst->ne[3] / n_str;
         for (int64_t q = ith; q < dst->ne[3]; q += nth) {
             const int32_t * sel = (const int32_t *)((const char *)indices->data + q*indices->nb[1]);
+            const char * base = (const char *)a->data + (q / n_tps)*a->nb[3];
             for (int64_t s = 0; s < np; ++s) {
                 if (s < ns) {
-                    dequantize_row_q8_0((const block_q8_0 *)((const char *)a->data + (size_t)sel[s]*a->nb[2]), row, d*nh);
+                    dequantize_row_q8_0((const block_q8_0 *)(base + (size_t)sel[s]*a->nb[2]), row, d*nh);
                 }
                 for (int64_t h = 0; h < nh; ++h) {
                     ggml_fp16_t * o = result + d*(s + np*(h + nh*q));
@@ -48,21 +55,26 @@ static void qsa_cpu(struct ggml_tensor * dst, int ith, int nth, void * userdata)
         ggml_fp16_t * result = dst->data;
         const struct ggml_tensor * indices = dst->src[1];
         const ggml_fp16_t padding = ggml_fp32_to_fp16(-INFINITY);
+        const int64_t n_tps = a->ne[1];
         for (int64_t q = ith; q < dst->ne[3]; q += nth) {
-            const ggml_fp16_t * m = (const ggml_fp16_t *)((const char *)a->data + q*a->nb[1]);
+            const ggml_fp16_t * m = (const ggml_fp16_t *)((const char *)a->data + (q / n_tps)*a->nb[3] + (q % n_tps)*a->nb[1]);
             const int32_t * row = (const int32_t *)((const char *)indices->data + q*indices->nb[1]);
             for (int64_t j = 0; j < dst->ne[0]; ++j) {
                 result[q*dst->ne[0]+j] = j < indices->ne[0] ? m[row[j]] : padding;
             }
         }
     } else if (kind == 9) {
-        const int32_t * cp = dst->src[0]->data; const int32_t * ps = dst->src[1]->data;
-        const int64_t n_kv = dst->ne[0], n_rows = dst->ne[1], n_tok = dst->src[1]->ne[0];
-        for (int64_t t = ith; t < n_rows; t += nth) {
-            for (int64_t c = 0; c < n_kv; ++c) {
-                const bool keep = t < n_tok && cp[c] >= 0 && cp[c] <= ps[t];
-                if (dst->type == GGML_TYPE_F16) ((ggml_fp16_t *) dst->data)[t*n_kv + c] = ggml_fp32_to_fp16(keep ? 0.0f : -INFINITY);
-                else ((float *) dst->data)[t*n_kv + c] = keep ? 0.0f : -INFINITY;
+        const struct ggml_tensor * cpt = dst->src[0];
+        const int32_t * cp = cpt->data; const int32_t * ps = dst->src[1]->data; const int32_t * kvs = dst->src[2]->data;
+        const int64_t n_kv = dst->ne[0], n_tps = dst->ne[1], n_ns = dst->ne[3], cp_stride = cpt->nb[1]/sizeof(int32_t);
+        for (int64_t st = ith; st < n_tps*n_ns; st += nth) {
+            const int64_t s = st / n_tps, t = st % n_tps;
+            const int32_t * cps = cp + (int64_t) kvs[s]*cp_stride;
+            const int32_t p1 = ps[s*n_tps + t];
+            for (int64_t c2 = 0; c2 < n_kv; ++c2) {
+                const bool keep = cps[c2] >= 0 && cps[c2] <= p1;
+                if (dst->type == GGML_TYPE_F16) ((ggml_fp16_t *) dst->data)[st*n_kv + c2] = ggml_fp32_to_fp16(keep ? 0.0f : -INFINITY);
+                else ((float *) dst->data)[st*n_kv + c2] = keep ? 0.0f : -INFINITY;
             }
         }
     } else if (kind == 5) {
@@ -101,10 +113,14 @@ static void qsa_cpu(struct ggml_tensor * dst, int ith, int nth, void * userdata)
         }
     } else {
         const struct ggml_tensor * mask = dst->src[2];
-        for (int64_t q = ith; q < dst->ne[1]; q += nth) {
-            const float * scores = (const float *)((const char *)a->data + q*a->nb[1]);
-            const ggml_fp16_t * m = (const ggml_fp16_t *)((const char *)mask->data + q*mask->nb[1]);
-            for (int64_t j = 0; j < dst->ne[0]; ++j) out[q*dst->ne[0]+j] = scores[ids[j]] + ggml_fp16_to_fp32(m[j]);
+        const struct ggml_tensor * idt = dst->src[1];
+        const int64_t n_tps = dst->ne[1];
+        for (int64_t qs = ith; qs < n_tps*dst->ne[2]; qs += nth) {
+            const int64_t s = qs / n_tps, q = qs % n_tps;
+            const float * scores = (const float *)((const char *)a->data + s*a->nb[2] + q*a->nb[1]);
+            const int32_t * ids_s = (const int32_t *)((const char *)idt->data + s*idt->nb[1]);
+            const ggml_fp16_t * m = (const ggml_fp16_t *)((const char *)mask->data + s*mask->nb[3] + q*mask->nb[1]);
+            for (int64_t j = 0; j < dst->ne[0]; ++j) out[qs*dst->ne[0]+j] = scores[ids_s[j]] + ggml_fp16_to_fp32(m[j]);
         }
     }
 }
@@ -118,27 +134,27 @@ float ggml_qsa_epsilon(const struct ggml_tensor * t) {
     float eps; memcpy(&eps,(const char *)t->op_params+sizeof(struct ggml_custom_op_params),sizeof(eps));return eps;
 }
 struct ggml_tensor * ggml_qsa_pool_norm(struct ggml_context * ctx, struct ggml_tensor * raw, struct ggml_tensor * ids, struct ggml_tensor * gamma, float eps) {
-    GGML_ASSERT(raw->type == GGML_TYPE_Q8_0 && raw->ne[0] == 128 && raw->ne[2] == 1 && raw->ne[3] == 1);
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0]%4 == 0 && ids->ne[1] == 1);
+    GGML_ASSERT(raw->type == GGML_TYPE_Q8_0 && raw->ne[0] == 128 && raw->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0]%4 == 0 && ids->ne[1] == raw->ne[2]); // one ids row per stream
     GGML_ASSERT(gamma->type == GGML_TYPE_F32 && ggml_nelements(gamma) == 128);
     GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(gamma));
     struct ggml_tensor * args[] = {raw,ids,gamma};
-    struct ggml_tensor * t = ggml_custom_4d(ctx,GGML_TYPE_F32,128,ids->ne[0]/4,1,1,args,3,qsa_cpu,GGML_N_TASKS_MAX,(void *)(intptr_t)1);
+    struct ggml_tensor * t = ggml_custom_4d(ctx,GGML_TYPE_F32,128,ids->ne[0]/4,ids->ne[1],1,args,3,qsa_cpu,GGML_N_TASKS_MAX,(void *)(intptr_t)1);
     memcpy((char *)t->op_params+sizeof(struct ggml_custom_op_params),&eps,sizeof(eps));return t;
 }
 struct ggml_tensor * ggml_qsa_expand(struct ggml_context * ctx, struct ggml_tensor * score, struct ggml_tensor * ids, struct ggml_tensor * mask) {
-    GGML_ASSERT(score->type == GGML_TYPE_F32 && score->ne[2] == 1 && score->ne[3] == 1);
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[1] == 1 && ggml_is_contiguous(ids));
-    GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[0] == ids->ne[0] && mask->ne[1] >= score->ne[1]);
+    GGML_ASSERT(score->type == GGML_TYPE_F32 && score->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[1] == score->ne[2] && ggml_is_contiguous(ids)); // [n_kv, n_stream]
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[0] == ids->ne[0] && mask->ne[1] >= score->ne[1] && mask->ne[3] == score->ne[2]);
     struct ggml_tensor * args[] = {score,ids,mask};
-    return ggml_custom_4d(ctx,GGML_TYPE_F32,ids->ne[0],score->ne[1],1,1,args,3,qsa_cpu,GGML_N_TASKS_MAX,(void *)(intptr_t)2);
+    return ggml_custom_4d(ctx,GGML_TYPE_F32,ids->ne[0],score->ne[1],score->ne[2],1,args,3,qsa_cpu,GGML_N_TASKS_MAX,(void *)(intptr_t)2);
 }
 
 struct ggml_tensor * ggml_qsa_mask_select(struct ggml_context * ctx, struct ggml_tensor * mask, struct ggml_tensor * ids, int64_t padded) {
     GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->nb[0] == sizeof(ggml_fp16_t));
-    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
+    GGML_ASSERT(mask->ne[2] == 1); // [n_kv, n_tps, 1, n_stream]
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t));
-    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1 && mask->ne[1] >= ids->ne[1]);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1 && mask->ne[1]*mask->ne[3] >= ids->ne[1]); // ids rows = n_tps*n_stream
     GGML_ASSERT(padded >= ids->ne[0] && padded%256 == 0);
     struct ggml_tensor * args[] = {mask,ids};
     return ggml_custom_4d(ctx,GGML_TYPE_F16,padded,1,1,ids->ne[1],args,2,qsa_cpu,GGML_N_TASKS_MAX,(void *)(intptr_t)3);
@@ -146,7 +162,7 @@ struct ggml_tensor * ggml_qsa_mask_select(struct ggml_context * ctx, struct ggml
 
 // Fused get_rows + pad + cast for the QSA compact path: one pass instead of three.
 GGML_API struct ggml_tensor * ggml_qsa_gather_f16(struct ggml_context * ctx, struct ggml_tensor * cache, struct ggml_tensor * ids, int64_t padded) {
-    GGML_ASSERT(cache->type == GGML_TYPE_Q8_0 && cache->ne[0] % 32 == 0 && cache->ne[3] == 1);
+    GGML_ASSERT(cache->type == GGML_TYPE_Q8_0 && cache->ne[0] % 32 == 0); // [d, h, n_kv, n_stream]
     GGML_ASSERT(cache->nb[1] == ggml_row_size(cache->type, cache->ne[0]) && cache->nb[2] == cache->ne[1]*cache->nb[1]);
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(padded >= ids->ne[0] && padded % 256 == 0);
@@ -169,9 +185,10 @@ struct ggml_tensor * ggml_hc_combine(struct ggml_context * ctx, struct ggml_tens
     struct ggml_tensor * args[] = {residual, block_out, inject};
     return ggml_custom_4d(ctx, GGML_TYPE_F32, residual->ne[0], hc, residual->ne[2], 1, args, 3, qsa_cpu, GGML_N_TASKS_MAX, (void *)(intptr_t)6);
 }
-struct ggml_tensor * ggml_kq_mask_dev(struct ggml_context * ctx, struct ggml_tensor * cell_pos, struct ggml_tensor * pos, int64_t n_kv, int64_t n_rows, enum ggml_type type) {
-    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && pos->type == GGML_TYPE_I32 && cell_pos->ne[0] >= n_kv && n_rows >= pos->ne[0]);
+struct ggml_tensor * ggml_kq_mask_dev(struct ggml_context * ctx, struct ggml_tensor * cell_pos, struct ggml_tensor * pos, struct ggml_tensor * kvs, int64_t n_kv, int64_t n_tps, int64_t n_ns, enum ggml_type type) {
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && pos->type == GGML_TYPE_I32 && kvs->type == GGML_TYPE_I32);
+    GGML_ASSERT(cell_pos->ne[0] >= n_kv && pos->ne[0] == n_tps*n_ns && kvs->ne[0] == n_ns && cell_pos->nb[0] == sizeof(int32_t));
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
-    struct ggml_tensor * args[] = {cell_pos, pos};
-    return ggml_custom_4d(ctx, type, n_kv, n_rows, 1, 1, args, 2, qsa_cpu, GGML_N_TASKS_MAX, (void *)(intptr_t)9);
+    struct ggml_tensor * args[] = {cell_pos, pos, kvs};
+    return ggml_custom_4d(ctx, type, n_kv, n_tps, 1, n_ns, args, 3, qsa_cpu, GGML_N_TASKS_MAX, (void *)(intptr_t)9);
 }
