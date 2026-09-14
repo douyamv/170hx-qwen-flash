@@ -1,5 +1,10 @@
 #include "q8a.cuh"
 #include <mutex>
+#include <vector>
+#include <string>
+#include <cstdio>
+#include <cmath>
+#include <algorithm>
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -132,30 +137,39 @@ __global__ void __launch_bounds__(256) q4a_gemv(const int8_t * __restrict__ wq, 
     }
 }
 
-// one warp per 2 rows x one K-split; lanes stride over 16-byte chunks (2 chunks per 32-quant block).
+// one warp per R rows x one K-split; lanes stride over 16-byte chunks (2 chunks per 32-quant block). the R weight loads
+// of an iteration are issued together so a warp keeps R*512 bytes in flight.
 // splitk == 1: write dst (+bias). splitk > 1: write partials [splitk][B][N], reduced deterministically afterwards.
-template <int B>
+template <int B, int R>
 __global__ void __launch_bounds__(256) q8a_gemv(const int8_t * __restrict__ wq, const half * __restrict__ wd,
         const int8_t * __restrict__ aq, const float * __restrict__ ad, const float * __restrict__ bias,
         float * __restrict__ out, const int N, const int K, const int splitk) {
-    constexpr int RPW = 2;
     const int lane = threadIdx.x & 31;
     const int warp = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
-    const int n0   = (warp / splitk) * RPW;
+    const int n0   = (warp / splitk) * R;
     const int ks   = warp % splitk;
     if (n0 >= N) return;
     const int nb     = K >> 5;
     const int nchunk = K >> 4;
     const int cpk    = nchunk / splitk;
     const int c0     = ks * cpk;
-    const bool has_r1 = n0 + 1 < N;
-    float acc[RPW][B];
+    float acc[R][B];
 #pragma unroll
-    for (int r = 0; r < RPW; ++r)
+    for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int b = 0; b < B; ++b) acc[r][b] = 0.f;
     for (int c = c0 + lane; c < c0 + cpk; c += 32) {
         const int blk = c >> 1;
+        int4 w[R]; float d[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (n0 + r < N) {
+                w[r] = *reinterpret_cast<const int4 *>(wq + (int64_t) (n0 + r) * K + (int64_t) c * 16);
+                d[r] = __half2float(wd[(int64_t) (n0 + r) * nb + blk]);
+            } else {
+                w[r] = make_int4(0, 0, 0, 0); d[r] = 0.f;
+            }
+        }
         int4 a[B]; float dab[B];
 #pragma unroll
         for (int b = 0; b < B; ++b) {
@@ -163,21 +177,17 @@ __global__ void __launch_bounds__(256) q8a_gemv(const int8_t * __restrict__ wq, 
             dab[b] = ad[(int64_t) b * nb + blk];
         }
 #pragma unroll
-        for (int r = 0; r < RPW; ++r) {
-            if (r == 1 && !has_r1) break;
-            const int n = n0 + r;
-            const int4 w = *reinterpret_cast<const int4 *>(wq + (int64_t) n * K + (int64_t) c * 16);
-            const float d = __half2float(wd[(int64_t) n * nb + blk]);
+        for (int r = 0; r < R; ++r) {
 #pragma unroll
             for (int b = 0; b < B; ++b) {
                 int s = 0;
-                s = __dp4a(w.x, a[b].x, s); s = __dp4a(w.y, a[b].y, s); s = __dp4a(w.z, a[b].z, s); s = __dp4a(w.w, a[b].w, s);
-                acc[r][b] += (float) s * d * dab[b];
+                s = __dp4a(w[r].x, a[b].x, s); s = __dp4a(w[r].y, a[b].y, s); s = __dp4a(w[r].z, a[b].z, s); s = __dp4a(w[r].w, a[b].w, s);
+                acc[r][b] += (float) s * d[r] * dab[b];
             }
         }
     }
 #pragma unroll
-    for (int r = 0; r < RPW; ++r)
+    for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int b = 0; b < B; ++b) {
             float v = acc[r][b];
@@ -187,8 +197,8 @@ __global__ void __launch_bounds__(256) q8a_gemv(const int8_t * __restrict__ wq, 
         }
     if (lane == 0) {
 #pragma unroll
-        for (int r = 0; r < RPW; ++r) {
-            if (r == 1 && !has_r1) break;
+        for (int r = 0; r < R; ++r) {
+            if (n0 + r >= N) break;
 #pragma unroll
             for (int b = 0; b < B; ++b) {
                 if (splitk == 1) {
@@ -199,6 +209,109 @@ __global__ void __launch_bounds__(256) q8a_gemv(const int8_t * __restrict__ wq, 
             }
         }
     }
+}
+
+typedef void (*q8a_kernel_t)(const int8_t *, const half *, const int8_t *, const float *, const float *, float *, int, int, int);
+
+template <int B> static q8a_kernel_t q8a_kernel_r(int R) {
+    switch (R) {
+        case 1: return q8a_gemv<B, 1>;
+        case 2: return q8a_gemv<B, 2>;
+        case 3: return q8a_gemv<B, 3>;
+        default: return q8a_gemv<B, 4>;
+    }
+}
+
+static q8a_kernel_t q8a_kernel(int B, int R) {
+    switch (B) {
+        case 1: return q8a_kernel_r<1>(R);
+        case 2: return q8a_kernel_r<2>(R);
+        case 3: return q8a_kernel_r<3>(R);
+        case 4: return q8a_kernel_r<4>(R);
+        case 5: return q8a_kernel_r<5>(R);
+        case 6: return q8a_kernel_r<6>(R);
+        case 7: return q8a_kernel_r<7>(R);
+        default: return q8a_kernel_r<8>(R);
+    }
+}
+
+struct q8a_plan { int R; int splitk; };
+struct q8a_plan_entry { int N, K, B, R, splitk; };
+
+// measured on CMP 170HX (70 SMs, 1.39 TB/s) with next/tools/bench/q8a_test2 + sweep2.sh: only shapes where the plan
+// beats the rule below by more than 3%. {N, K, B, rows per warp, K-splits}
+static const q8a_plan_entry q8a_measured[] = {
+//Q8A_TABLE_BEGIN
+    {10240, 320, 3, 3, 2},
+    {10240, 320, 4, 1, 4},
+    {320, 2560, 1, 1, 1},
+    {320, 2560, 3, 1, 1},
+    {320, 2560, 4, 1, 1},
+    {320, 2560, 5, 1, 1},
+    {640, 2560, 1, 4, 4},
+    {640, 2560, 3, 1, 1},
+    {640, 2560, 4, 1, 1},
+    {640, 2560, 5, 1, 1},
+    {2560, 2560, 3, 3, 1},
+    {2560, 2560, 4, 3, 4},
+    {2560, 2560, 5, 4, 4},
+    {6144, 2560, 4, 3, 4},
+    {6144, 2560, 5, 3, 1},
+    {10240, 2560, 1, 1, 4},
+    {10240, 2560, 4, 2, 4},
+    {10240, 2560, 5, 4, 1},
+    {12288, 2560, 3, 3, 1},
+    {12288, 2560, 4, 3, 1},
+    {12288, 2560, 5, 3, 1},
+    {2560, 6144, 1, 1, 1},
+//Q8A_TABLE_END
+};
+
+// the opt-v5 rule: 2 rows per warp; for K >= 4096 split K (whole 32-quant blocks) until ~2048 warps are in flight
+static q8a_plan q8a_plan_rule(int N, int K) {
+    const int nchunk = K / 16, warps_n = (N + 1) / 2;
+    int s = 1;
+    if (K >= 4096) {
+        while (warps_n * s < 2048 && s < 8 && nchunk % (s * 2) == 0 && nchunk / (s * 2) >= 64) s *= 2;
+    }
+    return {2, s};
+}
+
+static bool q8a_plan_valid(int K, int R, int s) {
+    const int nchunk = K / 16;
+    return R >= 1 && R <= 4 && s >= 1 && s <= 8 && nchunk % (2 * s) == 0 && nchunk / s >= 64;
+}
+
+// plan lookup order: NEXT_Q8A_RPW / NEXT_Q8A_SPLITK (experiments) > $NEXT_OPT_DIR/q8a_plans ("N K B R splitk" per line,
+// read once) > the measured table > the rule
+static q8a_plan q8a_choose(int N, int K, int B) {
+    static const int force_r = [] { const char * e = getenv("NEXT_Q8A_RPW");    return e ? atoi(e) : 0; }();
+    static const int force_s = [] { const char * e = getenv("NEXT_Q8A_SPLITK"); return e ? atoi(e) : 0; }();
+    if (force_r || force_s) {
+        q8a_plan p = q8a_plan_rule(N, K);
+        if (force_r) p.R = force_r;
+        if (force_s) p.splitk = force_s;
+        if (q8a_plan_valid(K, p.R, p.splitk)) return p;
+    }
+    static const std::vector<q8a_plan_entry> file_plans = [] {
+        std::vector<q8a_plan_entry> v;
+        const char * dir = getenv("NEXT_OPT_DIR");
+        if (dir == nullptr) return v;
+        FILE * f = fopen((std::string(dir) + "/q8a_plans").c_str(), "r");
+        if (f == nullptr) return v;
+        q8a_plan_entry e;
+        while (fscanf(f, "%d %d %d %d %d", &e.N, &e.K, &e.B, &e.R, &e.splitk) == 5) v.push_back(e);
+        fclose(f);
+        GGML_LOG_INFO("q8a: %zu plans read from %s/q8a_plans\n", v.size(), dir);
+        return v;
+    }();
+    for (const auto & e : file_plans) {
+        if (e.N == N && e.K == K && e.B == B && q8a_plan_valid(K, e.R, e.splitk)) return {e.R, e.splitk};
+    }
+    for (const auto & e : q8a_measured) {
+        if (e.N == N && e.K == K && e.B == B && q8a_plan_valid(K, e.R, e.splitk)) return {e.R, e.splitk};
+    }
+    return q8a_plan_rule(N, K);
 }
 
 static __global__ void q8a_reduce(const float * __restrict__ part, const float * __restrict__ bias, float * __restrict__ out, const int N, const int B, const int splitk) {
@@ -312,13 +425,18 @@ bool ggml_cuda_mul_mat_q8a(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
-    // occupancy: ~2048 warps in flight; split K (on 32-quant block boundaries) when N is small
     const int nchunk = K / 16;
-    const int warps_n = (N + 1) / 2;
-    int splitk = 1;
-    if (K >= 4096) {
-        while (warps_n * splitk < 2048 && splitk < 8 && nchunk % (splitk * 2) == 0 && nchunk / (splitk * 2) >= 64) splitk *= 2;
+    const q8a_plan plan = q8a_choose(N, K, B);
+    const int splitk = plan.splitk;
+    static const bool verbose = getenv("NEXT_Q8A_VERBOSE") != nullptr;
+    if (verbose) {
+        static std::mutex m; static std::unordered_map<int64_t, int> seen;
+        std::lock_guard<std::mutex> lock(m);
+        const int64_t key = ((int64_t) N << 40) | ((int64_t) K << 8) | B;
+        if (!seen[key]++) GGML_LOG_INFO("q8a: N=%d K=%d B=%d -> R=%d splitk=%d (%lld warps)\n", N, K, B, plan.R, splitk,
+            (long long) (((N + plan.R - 1) / plan.R) * splitk));
     }
+    GGML_ASSERT(nchunk % splitk == 0);
     const float * bias = (fusion && fusion->x_bias) ? (const float *) fusion->x_bias->data : nullptr;
     float * out = (float *) dst->data;
     ggml_cuda_pool_alloc<float> part(ctx.pool());
@@ -326,19 +444,9 @@ bool ggml_cuda_mul_mat_q8a(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         part.alloc((size_t) splitk * B * N);
         out = part.get();
     }
-    const int nwarps = warps_n * splitk;
-    const int blocks = (nwarps + 7) / 8;
-    switch (B) {
-        case 1: q8a_gemv<1><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        case 2: q8a_gemv<2><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        case 3: q8a_gemv<3><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        case 4: q8a_gemv<4><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        case 5: q8a_gemv<5><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        case 6: q8a_gemv<6><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        case 7: q8a_gemv<7><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        case 8: q8a_gemv<8><<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk); break;
-        default: GGML_ABORT("q8a: unsupported batch");
-    }
+    const int64_t nwarps = ((N + plan.R - 1) / plan.R) * (int64_t) splitk;
+    const int blocks = (int) ((nwarps + 7) / 8);
+    q8a_kernel(B, plan.R)<<<blocks, 256, 0, stream>>>(w.qs, w.d, aq.get(), ad.get(), bias, out, N, K, splitk);
     if (splitk > 1) {
         q8a_reduce<<<(B * N + 255) / 256, 256, 0, stream>>>(part.get(), bias, (float *) dst->data, N, B, splitk);
     }
