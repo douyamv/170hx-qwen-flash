@@ -24,6 +24,7 @@ GPU sampling), 4× CMP 170HX. Decode = generated tokens / second as reported by 
 | Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s |
 | Prefill 70K prompt | 159–186 s | **104 s** | 102 s |
 | Full 262K load from USB HDD | ~29 min | ~29 min | same |
+| Cold single request (2K prompt, 200 tokens, GPUs idle before) | 44 tok/s | 44 | **70 with the SM clock pinned (`nvidia-smi -lgc 1410,1410`, now in the service unit)** |
 
 Reference points from the community for the same GGUF: 5×RTX 3090 (layer split, no MTP) 54–57 tok/s short /
 42 tok/s at 250K ([issue #28734](https://github.com/ggml-org/llama.cpp/issues/28734)); one RTX PRO 6000:
@@ -45,6 +46,7 @@ on the mini model before deployment. Details, measurements and file pointers: [n
 | Scheduler | copy user inputs before cross-device inputs (no host stall at every GPU boundary); keep the scheduler on re-reserve instead of recreating it (was 0.6–0.9 s of `cudaMallocHost` per request) | TTFT 0.8–1.1 s → 0.25–0.4 s |
 | KV cache | honor `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` in `state_write/read` (server checkpoints were copying the whole MTP draft KV, up to 900 MB, every request) | TTFT at 200K 3.5 s → <1 s |
 | MTP | draft-only Q4_0 LM head (`make_mtp_q4head.py`), runtime `spec_n_max`/`spec_p_min`, acceptance-adaptive draft length | +4–17% depending on content |
+| GPU clocks | pin the SM clock at 1410 MHz in the service unit: the driver never boosts a GPU that is busy only ~30% of the time in a 3-GPU pipeline | cold requests 44 → 70 tok/s; sustained runs unchanged (they already boosted) |
 | Misc | GDN l2norm fix backported from upstream (#28068); `token_embd` kept in VRAM (was page-faulting from the HDD); strided conv-state store; mmvf for tiny-N F32 weights; CUDA-graph key stability for MTP | stability / jitter |
 
 Runtime toggles live in `$NEXT_OPT_DIR` as plain files (see [next/deploy/README.md](next/deploy/README.md)):

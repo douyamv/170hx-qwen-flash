@@ -49,6 +49,18 @@ CUPTI tracer (`../tools/trace/next-trace.cpp`; passive until the flag file exist
 Environment kill-switches (startup only): `NEXT_Q8A=0`, `NEXT_Q8A_MAX_MB`, `NEXT_MOEA=1` (opt-in), `NEXT_TOPK_SORT=1`,
 `NEXT_QSA_NO_BLKCACHE=1`, `NEXT_QSA_PREP_GENERIC=1`, `NEXT_SCHED_RECREATE=1`.
 
+## GPU clocks (do this first)
+
+With a single request in flight the layer-split pipeline keeps each GPU busy only 20–35% of the time, and the NVIDIA
+driver never raises the SM clock above the 1140 MHz idle level (memory stays at 1215 MHz). The same 200-token request
+decoded at 44 tok/s cold and 70 tok/s with the clock pinned:
+
+```
+sudo nvidia-smi -lgc 1410,1410     # all GPUs; undo with nvidia-smi -rgc
+```
+
+The service unit does this in `ExecStartPre`. Idle power rises from ~42 W to ~55 W per card.
+
 ## Services
 
 - `qwen38-flashnext-opt-262k.service` — the server (needs `TimeoutStopSec` because the HDD load takes ~29 min;

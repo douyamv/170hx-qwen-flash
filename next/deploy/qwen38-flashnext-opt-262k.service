@@ -10,6 +10,9 @@ Group=douya
 WorkingDirectory=/home/douya
 # Cold boots bring the CMP 170HX links up at Gen1; restore Gen2 before loading (no-op when already Gen2).
 ExecStartPre=-+/usr/bin/python3 /home/douya/qwen-3.8-next/cmp170hx-gen2-hotload.py
+# lock the SM clock at the maximum: with one request in flight each GPU is busy only ~30% of the time and the driver
+# never leaves the 1140 MHz idle clock (a cold single request decoded at 44 instead of 70 tok/s)
+ExecStartPre=-+/usr/bin/nvidia-smi -lgc 1410,1410
 ExecStart=/usr/bin/python3 /home/douya/qwen-3.8-next-opt/run-server.py
 StandardOutput=append:/home/douya/qwen-3.8-next-opt/logs/server.log
 StandardError=append:/home/douya/qwen-3.8-next-opt/logs/server.log
