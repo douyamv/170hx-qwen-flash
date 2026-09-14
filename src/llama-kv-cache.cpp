@@ -387,9 +387,9 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    cell_pos_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        cell_pos_dirty = true;
         return true;
     }
 
@@ -416,6 +416,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                cell_pos_touch(seq_to_stream[seq_id], i); // NEXT: the device position table forgets this cell
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -440,6 +441,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 cells.rm(i);
+                cell_pos_touch(s, i); // NEXT
 
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -454,6 +456,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     return true;
+}
+
+void llama_kv_cache::cell_pos_touch(uint32_t strm, uint32_t i) const {
+    if (cell_pos_dirty || cell_pos_dev.empty()) {
+        return; // a full upload is pending anyway
+    }
+    if (cell_pos_dirty_rng.size() < n_stream) {
+        cell_pos_dirty_rng.assign(n_stream, {UINT32_MAX, 0});
+    }
+    auto & r = cell_pos_dirty_rng[strm];
+    r.first  = std::min(r.first, i);
+    r.second = std::max(r.second, i);
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -1852,10 +1866,32 @@ std::vector<int32_t> llama_kv_cache::get_cell_pos_host() const {
 }
 
 void llama_kv_cache::upload_cell_pos() const {
+    const uint32_t kv_size = v_cells[0].size();
     if (!cell_pos_dirty) {
+        // partial: only the cell ranges that seq_rm emptied since the last upload
+        if (cell_pos_dirty_rng.size() < n_stream) {
+            return;
+        }
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            auto & r = cell_pos_dirty_rng[s];
+            if (r.first > r.second) {
+                continue;
+            }
+            const uint32_t lo = r.first, hi = std::min<uint32_t>(r.second, kv_size - 1);
+            std::vector<int32_t> host(hi - lo + 1);
+            const auto & cells = v_cells[s];
+            for (uint32_t i = lo; i <= hi; ++i) {
+                host[i - lo] = cells.is_empty(i) ? -1 : cells.pos_get(i);
+            }
+            for (const auto & e : cell_pos_dev) {
+                if (e.second->data) {
+                    ggml_backend_tensor_set(e.second, host.data(), ((size_t) s * kv_size + lo) * sizeof(int32_t), host.size() * sizeof(int32_t));
+                }
+            }
+            r = {UINT32_MAX, 0};
+        }
         return;
     }
-    const uint32_t kv_size = v_cells[0].size();
     std::vector<int32_t> host((size_t) kv_size * n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
@@ -1869,6 +1905,7 @@ void llama_kv_cache::upload_cell_pos() const {
         }
     }
     cell_pos_dirty = false;
+    cell_pos_dirty_rng.assign(n_stream, {UINT32_MAX, 0});
 }
 
 void llama_kv_cache::update_cell_pos(const slot_info & sinfo, const llama_ubatch & ubatch) {

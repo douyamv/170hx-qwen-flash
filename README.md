@@ -16,11 +16,11 @@ tracing/benchmark tooling and a 4-layer "mini model" harness used to validate ev
 Single request (`--parallel 1`), UD-Q4_K_XL weights, q8_0 KV cache, MTP speculative decoding (draft length 4,
 GPU sampling), 4× CMP 170HX. Decode = generated tokens / second as reported by `llama-server` (`print_timing`).
 
-| Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14 01:25) | This repo (opt-v5, 2026-09-14 07:23, measured) | opt-v6 (2026-09-14 11:17, SM clock pinned) | opt-v6.2 (2026-09-14 17:37, GPU-generated KQ mask) |
-|---|---|---|---|---|---|
-| 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** | **85–102 greedy (4/q4 101.9), 71–104 sampled (4/q4 103.9)** | 80–95 greedy right after the cold start (3/q4 79.7, 4/q4 90.3, 5/q4 95.4, 5/q8 90.0); the greedy trajectories differ from v6.1 (rounding-level, see OPTIMIZATIONS row 23), and with them the draft acceptance (4/q4 71 % → 64 %, 5/q4 61 % → 70 %), which moves these 300-token numbers by ±10 % |
-| 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** | **70–81 greedy (4/q4 81.4), 56–82 sampled (5/q4 81.9); v6.1 (GPU-sampled draft): 89.2 greedy** | to be measured (server handed to the user right after the deploy) |
-| 200K | 27–37 | 35–45 | not re-measured | **59.6 greedy (4/q4), 46.6 sampled; 16-token turn TTFT 0.64 s, 3-token 0.39 s; prefill 200K 408 s** | to be measured |
+| Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14 01:25) | This repo (opt-v5, 2026-09-14 07:23, measured) | opt-v6 (2026-09-14 11:17, SM clock pinned) | opt-v6.2 (2026-09-14 17:37, GPU-generated KQ mask) | opt-v8.1 (2026-09-15 06:20, 3 slots × 262K, huihui abliterated target) |
+|---|---|---|---|---|---|---|
+| 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** | **85–102 greedy (4/q4 101.9), 71–104 sampled (4/q4 103.9)** | 80–95 greedy right after the cold start (3/q4 79.7, 4/q4 90.3, 5/q4 95.4, 5/q8 90.0); the greedy trajectories differ from v6.1 (rounding-level, see OPTIMIZATIONS row 23), and with them the draft acceptance (4/q4 71 % → 64 %, 5/q4 61 % → 70 %), which moves these 300-token numbers by ±10 % | **96.9** greedy 4/q4 single request (3/q4 86.9, 5/q8 78.8); 3 concurrent 3K requests 34–37 tok/s each = **100 tok/s aggregate**, 2 concurrent 58 + 54 = 101 |
+| 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** | **70–81 greedy (4/q4 81.4), 56–82 sampled (5/q4 81.9); v6.1 (GPU-sampled draft): 89.2 greedy** | to be measured (server handed to the user right after the deploy) | **87.7** single request; 70K + two 3K agents concurrently 29 / 22 / 32 = 63.5 aggregate |
+| 200K | 27–37 | 35–45 | not re-measured | **59.6 greedy (4/q4), 46.6 sampled; 16-token turn TTFT 0.64 s, 3-token 0.39 s; prefill 200K 408 s** | to be measured | not re-measured |
 | Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s | 0.24–0.43 s |
 | Prefill 70K prompt | 159–186 s | **104 s** | 102 s | 102 s |
 | Full 262K load from USB HDD | ~29 min | ~29 min | same | same |
@@ -53,6 +53,7 @@ on the mini model before deployment. Details, measurements and file pointers: [n
 | KV cache | honor `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` in `state_write/read` (server checkpoints were copying the whole MTP draft KV, up to 900 MB, every request) | TTFT at 200K 3.5 s → <1 s |
 | MTP | draft-only Q4_0 LM head (`make_mtp_q4head.py`), runtime `spec_n_max`/`spec_p_min`, acceptance-adaptive draft length | +4–17% depending on content |
 | GPU clocks | pin the SM clock at 1410 MHz in the service unit: the driver never boosts a GPU that is busy only ~30% of the time in a 3-GPU pipeline | cold requests 44 → 70 tok/s; sustained runs unchanged (they already boosted) |
+| Three slots of 262K each (opt-v8.1) | one KV stream per slot, the draft / `token_embd` / output head moved to the spare GPU, stream-aware QSA kernels and GPU mask, incremental cell-table uploads (OPTIMIZATIONS rows 24–25); concurrent agents keep their own prompt caches | single-request speed kept (2K 96.9, 70K 87.7), 2–3 concurrent requests ≈ 100 tok/s aggregate; VRAM +3.7 GB per layer GPU |
 | GPU-generated KQ mask (opt-v6.2) | the causal mask is computed on each device from a cell-position table instead of being filled on the host and uploaded to every device each step; validated to the mask entry with a readback check (OPTIMIZATIONS row 23) | VRAM −216 / −218 / −262 MB on the three layer GPUs at `-ub 1024`, 262K; per-step host time and 70K/200K speeds pending |
 | Misc | GDN l2norm fix backported from upstream (#28068); `token_embd` kept in VRAM (was page-faulting from the HDD); strided conv-state store; mmvf for tiny-N F32 weights; CUDA-graph key stability for MTP | stability / jitter |
 

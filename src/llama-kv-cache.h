@@ -326,7 +326,9 @@ private:
 
     // NEXT: see device_mask_ok()
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_tensor *>> cell_pos_dev;
-    mutable bool cell_pos_dirty = true;
+    mutable bool cell_pos_dirty = true;                                       // full re-upload pending
+    mutable std::vector<std::pair<uint32_t, uint32_t>> cell_pos_dirty_rng;    // per stream: [lo, hi] cells changed since the last upload (lo > hi: none)
+    void cell_pos_touch(uint32_t strm, uint32_t i) const;
     void update_cell_pos(const slot_info & sinfo, const llama_ubatch & ubatch);
 
     // model layer id -> KV cache layer id
