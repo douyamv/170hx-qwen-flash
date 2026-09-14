@@ -57,7 +57,7 @@ GPU kernels 46 ms of a ~52 ms step (89%); host ~6 ms.
 |---|---|---|---|
 | 18 | `q8a` v2: rows-per-warp is a template parameter (1–4), the R weight loads of an iteration are issued together; the (R, K-splits) plan per shape comes from a measured table (`q8a_measured`, built with `next/tools/bench/q8a_test2` + `sweep2.sh`), overridable at runtime with `$NEXT_OPT_DIR/q8a_plans` (`N K B R splitk` per line) and for experiments with `NEXT_Q8A_RPW` / `NEXT_Q8A_SPLITK`; `NEXT_Q8A_VERBOSE=1` logs the plan per shape. A first analytical wave-quantization model was wrong (partial last waves cost far less than a full wave), hence the table | `ggml/src/ggml-cuda/q8a.cu` | sweep with the SM clock pinned (min of 7×100 graph evaluations), best plan vs the v5 rule (R=2): 2560×6144 B=5 23.0 → 21.0 µs (R=3), B=4 22.1 → 19.0 (R=3, 4 splits); 2560×12288 B=4 36.6 → 33.7, B=5 37.9 → 35.9 (R=3); 2560×10240 B=5 31.5 → 29.2 (R=4), B=1 21.9 → 19.8 (R=1, 4 splits); 2560×2560 B=5 28.8 → 17.0 (R=4, 4 splits: the rule left the GPU half empty); N=320/640 rows 10–14% (R=1); K=6144 shapes unchanged. 22 table entries, everything else keeps the rule |
 | 19 | top-k without the final in-block sort (`NEXT_TOPK_NOSORT=1`): `ggml_top_k` promises no order and the QSA consumers (gather + mask select) are order-independent; the sort existed only to be bit-identical to the argsort fallback | `ggml/src/ggml-cuda/top-k.cu` | 4 × 92 µs per device per step at 70K (k = 2051 → the 4096-element bitonic sort ran on one SM per row) |
-| 20 | asynchronous graph-input uploads in the scheduler (`NEXT_SCHED_ASYNC_INPUTS=1`): pinned host inputs go through `ggml_backend_tensor_set_async` instead of copy + per-tensor stream synchronize (llama.cpp never rewrites an input before the graph that reads it has completed) | `ggml/src/ggml-backend.cpp` | ASYNC_NUMBERS |
+| 20 | asynchronous graph-input uploads in the scheduler (`NEXT_SCHED_ASYNC_INPUTS=1`): pinned host inputs go through `ggml_backend_tensor_set_async` instead of copy + per-tensor stream synchronize (llama.cpp never rewrites an input before the graph that reads it has completed) | `ggml/src/ggml-backend.cpp` | mini: tokens bit-identical with the flag on and off (host-only change); ~114 `cudaMemcpyAsync` + per-tensor synchronizes per step no longer serialize the host; production effect measured with opt-v6 |
 | 22 | SM clock pinned at 1410 MHz (`nvidia-smi -lgc 1410,1410` in `ExecStartPre`): `nvidia-smi` sampled during a decode showed GPUs 0/1/3 at 1140 MHz with 20–35% utilization each — the governor never boosts a GPU that idles two thirds of every step | systemd unit | the same cold 200-token request 44.4 → 70.5 tok/s (identical tokens); `prod_sweep` numbers (sustained, already boosted) unchanged: 2K greedy 4/q4 75.3, 70K 71.3 |
 | 21 | runtime A/B switches without a reload: `$NEXT_OPT_DIR/moea_off` (moea → mmvq; the CUDA graph is re-captured), `$NEXT_OPT_DIR/q8a_plans` | `moea.cu`, `q8a.cu` | — |
 
@@ -66,6 +66,14 @@ kernels at 25% theoretical occupancy (120 registers), 0.76 eligible warps per sc
 blocks; `an_host.py` on the CUPTI trace showed ~320 `cudaStreamSynchronize` and ~114 `cudaMemcpyAsync` per step
 (per-tensor input uploads for 3 devices + 4 MTP steps) and ~6 MB/step of H2D at 70K; `LLAMA_GRAPH_RESULT_DEBUG=1`
 showed llama's graph reuse working (132 of 136 decodes on the mini), so host time is not graph building.
+
+Two more facts that settle "is the CPU the bottleneck?": during a 2K decode the server's main thread uses 6% of one
+core and the whole process 13% (`ps -L`, `/proc/<pid>/stat`) — the host is blocked in `cudaStreamSynchronize`
+waiting for the GPUs, not computing; and the decode is already graph-launched (7 `cudaGraphLaunch` per step: 3 target
+splits + 4 MTP draft steps). What remains on the host side is one re-capture of a ~242-node graph every step
+(1 `cudaStreamBeginCapture` + 242 `cudaLaunchKernel`) and a full 4325-node re-capture whenever the verify batch size
+changes (about every 25 steps) — ~1.4 ms per step, the concrete target for the next round. Per-GPU utilization of
+20–35% is the layer-split pipeline (one GPU works at a time), not CPU starvation; only tensor parallelism changes it.
 
 Mini model end-to-end (4 layers, one GPU, ms per generated token, greedy, no MTP): baseline 12.85 (2K) / 14.66 (16K);
 Phase C 11.07 (2K) / 12.73 (16K) → −13%. The mini has one QSA layer and one GPU, so its numbers understate the
