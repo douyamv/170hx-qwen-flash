@@ -1177,8 +1177,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask ? inp_attn->self_kq_mask : inp_attn->self_kq_mask_cnv, mctx->get_attn(), params.ubatch, params.cparams);
-    res &= inp_attn->self_pos == nullptr || inp_attn->self_pos->ne[0] == params.ubatch.n_tokens;
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
