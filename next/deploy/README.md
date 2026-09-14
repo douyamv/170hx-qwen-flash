@@ -68,6 +68,17 @@ The service unit does this in `ExecStartPre`. Idle power rises from ~42 W to ~55
 - `qwen38-lb.service` — `proxy.py`, a tiny OpenAI-compatible reverse proxy on :8080 that rewrites model aliases
   and injects `"backend_sampling": true`.
 
+## What the 4-layer mini can and cannot validate
+
+The mini's next-token distribution is almost flat (top-1 vs top-2 probability 4.9e-4 vs 4.8e-4 at the first
+position of the 2K test prompt), so its greedy stream flips on differences of ~1e-5. It is a strong test for
+crashes, shapes, the checkpoint/rewind logic and for changes that must be bit-identical (fusions, scheduler
+ordering, split placement). It cannot judge numerics-level kernel changes (moea, q8a plans): for those compare the
+kernel against a FP32 reference on the real expert weights (`../tools/bench/moea_test3.cpp`, `q8a_test.cpp`) and
+A/B on production with the runtime kill files. Observed: with `moea` on, moving `token_embd`/the MTP draft to another
+GPU changed the mini's stream after 11 tokens while every other feature was placement-invariant — the kernel itself is
+bitwise deterministic across GPUs and runs; the flip is a near-tie amplified by a placement-dependent ulp difference.
+
 ## Validation before restarting production
 
 A load takes ~29 minutes, so nothing goes live untested:
