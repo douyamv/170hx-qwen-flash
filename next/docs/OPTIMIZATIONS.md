@@ -51,7 +51,10 @@ GPU kernels 46 ms of a ~52 ms step (89%); host ~6 ms.
 | 16 | `moea` v3: expert-grouped MoE GEMV (`mul_mat_id`, ≤ 8 tokens). `mm_ids_helper` groups the (token, slot) pairs per expert; a compact list of active experts sizes the grid (with 512 experts and 5 tokens, 90% of the per-expert blocks used to exit empty); a warp owns 4 rows (Q4_K, 8 lanes per row, 16-byte loads) or 8 rows (Q5_1, 4 lanes per row, 8-byte loads) and processes the expert's tokens 2 per pass, so the kernels stay at 80 registers (3 blocks/SM). Activations are quantized once per column to int8 with an fp32 {scale, sum} per 32-block (per token for up/gate, per (token, slot) for down); fused up·silu(gate). Unfused Q4_K also goes through moea (no speed gain there, but it keeps the numerics independent of whether the scheduler fused up/gate/swiglu — fusion depends on node order, which differs between device splits; with the unfused case on mmvq a 1-GPU and a 2-GPU run of the mini diverged while every other feature was split-invariant). Off: `NEXT_MOEA=0` at startup or the runtime file `$NEXT_OPT_DIR/moea_off` | `ggml/src/ggml-cuda/moea.{cu,cuh}`, `mmvq.cu` | on the real experts of the model (mini GGUF layers 1/3, T=5): up/gate+swiglu 212 → 185 µs graph, same error as mmvq (mean rel 1.77e-2 vs the FP32 reference for both); down (Q5_1) error halved (1.14e-2 vs 2.34e-2: exact int block sums instead of fp16). Synthetic E=64/128: Q4_K gate T=5 134 → 101 µs, T=8 218 → 136; Q5_1 T=5 96 → 73, T=8 139 → 89. v1/v2 (8 tokens preloaded, 120 regs, 2 rows/warp) were 1.5–10× slower than mmvq: register pressure + wave quantization, found with `ncu` |
 | 17 | mmvf for F32/F16 weights with N ≤ 64 (GDN β/α projections went through cuBLAS TF32 + split-K) | `ggml/src/ggml-cuda/mmvf.cu` | 2 launches → 1 per projection, full FP32 |
 
-## Phase D (opt-v6, 2026-09-14)
+## Phase D (opt-v6, deployed 2026-09-14 11:17 as lib-new21 + launch.json.v4b)
+
+opt-v6 = opt-v5 + moea v3.2 (default on) + q8a v2 plan table + `NEXT_TOPK_NOSORT=1` + the SM clock pin; the asynchronous
+input upload (row 20) stays off. Backups on the box: `bin.prev7`, `launch.json.prev7` (= opt-v5).
 
 | # | Change | Files | Measured |
 |---|---|---|---|

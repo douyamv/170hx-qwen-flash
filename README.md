@@ -16,15 +16,15 @@ tracing/benchmark tooling and a 4-layer "mini model" harness used to validate ev
 Single request (`--parallel 1`), UD-Q4_K_XL weights, q8_0 KV cache, MTP speculative decoding (draft length 4,
 GPU sampling), 4× CMP 170HX. Decode = generated tokens / second as reported by `llama-server` (`print_timing`).
 
-| Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14 01:25) | This repo (opt-v5, 2026-09-14 07:23, measured) |
-|---|---|---|---|
-| 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** |
-| 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** |
-| 200K | 27–37 | 35–45 | not yet re-measured (expected 45–55) |
-| Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s |
-| Prefill 70K prompt | 159–186 s | **104 s** | 102 s |
-| Full 262K load from USB HDD | ~29 min | ~29 min | same |
-| Cold single request (2K prompt, 200 tokens, GPUs idle before) | 44 tok/s | 44 | **70 with the SM clock pinned (`nvidia-smi -lgc 1410,1410`, now in the service unit)** |
+| Context | Baseline fork (2026-09-13) | This repo (opt-v4, 2026-09-14 01:25) | This repo (opt-v5, 2026-09-14 07:23, measured) | opt-v6 (2026-09-14 11:17, SM clock pinned) |
+|---|---|---|---|---|
+| 2K | 46–55 tok/s | 60–72 | **64–73 (greedy 70–73, sampled 64–72; 48-token turns 82–87)** | V6_2K |
+| 70K | 27–45 | 45–52 | **58–70 (greedy 63–70, sampled 58–67)** | V6_70K |
+| 200K | 27–37 | 35–45 | not yet re-measured (expected 45–55) | not yet measured |
+| Time to first token, 4–17 new tokens at 70K | 0.4–1.2 s (up to 3.5 s at 200K) | **0.25–0.4 s** | 0.24–0.45 s | V6_TTFT |
+| Prefill 70K prompt | 159–186 s | **104 s** | 102 s | V6_PREFILL |
+| Full 262K load from USB HDD | ~29 min | ~29 min | same | same |
+| Cold single request (2K prompt, 200 tokens, GPUs idle before) | 44 tok/s | 44 | **70 with the SM clock pinned (`nvidia-smi -lgc 1410,1410`, now in the service unit)** | pinned |
 
 Reference points from the community for the same GGUF: 5×RTX 3090 (layer split, no MTP) 54–57 tok/s short /
 42 tok/s at 250K ([issue #28734](https://github.com/ggml-org/llama.cpp/issues/28734)); one RTX PRO 6000:
